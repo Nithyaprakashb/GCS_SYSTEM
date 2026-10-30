@@ -1,0 +1,35 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# --- Node / build output ---
+node_modules/
+desktop/dist/
+desktop/release/
+*.tsbuildinfo
+*.local
+
+# --- Electron packaging artefacts (installer is 89 MB, over GitHub's 100 MB file limit) ---
+*.asar
+*.exe
+
+# --- Runtime state and evidence ---
+# The SQLite evidence database, per-mission folders and procedurally generated
+# map tiles are produced at run time. They are reproducible from the seeded
+# sample KML and are deliberately kept out of the source repository.
+data/
+logs/
+
+# --- Secrets ---
+.env
+.env.*
+*.key
+credentials.json
+
+# --- OS noise ---
+Thumbs.db
+desktop.ini
+.DS_Store

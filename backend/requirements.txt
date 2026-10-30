@@ -1,0 +1,18 @@
+# RescueSwarm GCS — backend runtime and test requirements.
+# Verified on Windows 11 with CPython 3.14.2 (see docs/TEST_REPORT.md).
+# The GCS is offline-first: none of these packages contact a cloud service at
+# runtime, and no online LLM or map tile provider is required.
+
+fastapi>=0.115,<1.0
+uvicorn>=0.30,<1.0
+websockets>=13,<20
+pydantic>=2.7,<3.0
+pymavlink>=2.4.40,<3.0
+shapely>=2.0,<3.0
+numpy>=1.26,<3.0
+Pillow>=10.0,<13.0
+opencv-python>=4.9,<6.0
+
+# Test-only
+pytest>=8.0,<10.0
+httpx>=0.27,<1.0

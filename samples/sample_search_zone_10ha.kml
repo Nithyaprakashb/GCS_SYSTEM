@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>RescueSwarm — Sample 500 x 200 m search zone</name>
+    <description>Synthetic 10 ha training polygon for SIMULATION only. Not a real NIDAR venue.</description>
+    <Placemark>
+      <name>SIMULATION ONLY — 10 ha sample search zone</name>
+      <Style>
+        <LineStyle><color>ff00d7ff</color><width>2</width></LineStyle>
+        <PolyStyle><color>2200a5ff</color></PolyStyle>
+      </Style>
+      <Polygon>
+        <outerBoundaryIs>
+          <LinearRing>
+            <coordinates>
+              77.597702,12.949100,0
+              77.602298,12.949100,0
+              77.602298,12.950900,0
+              77.597702,12.950900,0
+              77.597702,12.949100,0
+            </coordinates>
+          </LinearRing>
+        </outerBoundaryIs>
+      </Polygon>
+    </Placemark>
+  </Document>
+</kml>

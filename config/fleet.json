@@ -1,0 +1,149 @@
+{
+  "profile_version": "1.0.0",
+  "profile_name": "NIDAR PS1 — three-aircraft baseline",
+  "fleet": [
+    {
+      "callsign": "INS-01",
+      "sysid": 1,
+      "role": "SEARCH",
+      "vehicle_type": "quadcopter",
+      "frame": "650 mm X4",
+      "search_alt_m": 12.0,
+      "search_speed_ms": 8.0,
+      "transit_alt_m": 25.0,
+      "rtl_alt_m": 25.0,
+      "battery_low_pct": 30.0,
+      "battery_critical_pct": 18.0,
+      "camera_hfov_deg": 102.0,
+      "camera_vfov_deg": 67.0,
+      "camera_width_px": 1280,
+      "kits": 0,
+      "kit_prefix": null
+    },
+    {
+      "callsign": "DEL-01",
+      "sysid": 2,
+      "role": "DELIVERY",
+      "vehicle_type": "hexacopter",
+      "frame": "900 mm X6",
+      "transit_alt_m": 18.0,
+      "delivery_speed_ms": 10.0,
+      "drop_height_m": 3.0,
+      "rtl_alt_m": 18.0,
+      "battery_low_pct": 28.0,
+      "battery_critical_pct": 16.0,
+      "kits": 5,
+      "kit_prefix": "DEL-01-K"
+    },
+    {
+      "callsign": "DEL-02",
+      "sysid": 3,
+      "role": "DELIVERY",
+      "vehicle_type": "hexacopter",
+      "frame": "900 mm X6",
+      "transit_alt_m": 22.0,
+      "delivery_speed_ms": 10.0,
+      "drop_height_m": 3.0,
+      "rtl_alt_m": 22.0,
+      "battery_low_pct": 28.0,
+      "battery_critical_pct": 16.0,
+      "kits": 5,
+      "kit_prefix": "DEL-02-K"
+    }
+  ],
+  "telemetry": {
+    "topology": "shared",
+    "topology_verified": false,
+    "gcs_sysid": 255,
+    "baud": 57600,
+    "shared_endpoint": null,
+    "independent_endpoints": {
+      "INS-01": null,
+      "DEL-01": null,
+      "DEL-02": null
+    },
+    "heartbeat_timeout_s": 3.0,
+    "stale_after_s": 2.0,
+    "command_timeout_s": 2.5,
+    "command_retries": 2,
+    "radio_firmware": null,
+    "radio_hardware_revision": null,
+    "radio_region": "IN — unverified"
+  },
+  "mission": {
+    "max_survivors": 10,
+    "time_cap_min": 30.0,
+    "target_time_min": 15.0,
+    "merge_distance_m": 5.0,
+    "descent_clearance_m": 20.0,
+    "descent_clearance_vertical_m": 4.0,
+    "proximity_warn_m": 8.0,
+    "boundary_warn_m": 2.0,
+    "boundary_drop_inset_m": 2.0,
+    "lane_inset_m": 3.0,
+    "usable_swath_fraction": 0.8,
+    "service_time_s": 25.0,
+    "turn_time_s": 3.0,
+    "takeoff_time_s": 30.0,
+    "recovery_time_s": 105.0,
+    "delivery_tail_min": [1.0, 2.5],
+    "battery_search_pct_per_min": 3.2,
+    "battery_delivery_pct_per_min": 2.6,
+    "battery_reserve_pct": 22.0,
+    "min_area_m2": 1000.0,
+    "max_area_m2": 1000000.0,
+    "min_battery_to_launch_pct": 55.0,
+    "hover_verify_s": 4.0,
+    "descent_rate_ms": 1.5,
+    "climb_rate_ms": 2.5,
+    "pad_name": "PAD-A",
+    "pad_lat": 12.94870,
+    "pad_lon": 77.59910,
+    "pad_radius_m": 1.83
+  },
+  "video": {
+    "feeds": [
+      {
+        "feed_id": "A",
+        "callsign": "INS-01",
+        "receiver": "RX-A",
+        "device_fingerprint": null,
+        "mapped": false,
+        "note": "RunCam Nano 2 — operator video only; AI detections are not overlaid"
+      },
+      {
+        "feed_id": "B",
+        "callsign": "DEL-01",
+        "receiver": "RX-B",
+        "device_fingerprint": null,
+        "mapped": false
+      },
+      {
+        "feed_id": "C",
+        "callsign": "DEL-02",
+        "receiver": "RX-C",
+        "device_fingerprint": null,
+        "mapped": false
+      }
+    ],
+    "sim_fps": 6,
+    "freeze_timeout_s": 2.0,
+    "black_luma_threshold": 12.0,
+    "recordings_dir": "video",
+    "required_for_readiness": true
+  },
+  "copilot": {
+    "llm_enabled": false,
+    "ollama_url": "http://127.0.0.1:11434",
+    "model": "llama3.1:8b",
+    "timeout_s": 12
+  },
+  "simulation": {
+    "speed": 8.0,
+    "fps": 10.0,
+    "survivors": 10,
+    "seed": 71,
+    "breakbeam_failure_probability": 0.08,
+    "detection_noise_m": 0.6
+  }
+}
