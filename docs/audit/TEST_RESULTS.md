@@ -79,6 +79,15 @@ python tools/offline_map.py build --zooms 10-16
   investigated (tile byte totals shift with encoder state and with what else is in the output
   directory), and it is recorded rather than reconciled. The tile *count* agrees at 1,572.
 
+- `python tools/offline_map.py build --zooms 10-16` re-run after the documentation pass, with
+  the whole suite and the typechecker alongside it: **118 passed in 28.23 s**, `tsc --noEmit`
+  exit 0. Same counts as §1.1; the two timings are two executions, not two results.
+- `docs/API.md` and `api.py` were diffed programmatically: **53 HTTP endpoints over 50 distinct
+  paths** (`/api/missions/{mission_id}/report` is GET *and* POST) plus the WebSocket at `/ws`,
+  all present in the document. The doc used `{id}` where the route declares `{mission_id}`;
+  corrected. Two routes that existed and were tested but undocumented — `POST /api/system/shutdown`
+  and `GET /api/map/manifest` — are now documented.
+
 ## 2. Fix-verification experiments (a test that never failed proves nothing)
 
 Each cluster was reverted, the tests re-run, and the code restored. The "restored"

@@ -6,6 +6,11 @@ policy. There is no authentication layer because the bind address is loopback an
 the Host header is allow-listed; there is **no remote access mode**.
 
 - OpenAPI schema: `GET /docs` (FastAPI built-in)
+- Surface: **53 HTTP endpoints over 50 distinct paths** (`/api/missions/{mission_id}/report`
+  answers both GET and POST) plus one WebSocket. Every one of them appears in this document;
+  the route table and `rescueswarm/api.py` were diffed on 2026-11-01.
+- The WebSocket is mounted at `/ws`, **not** under `/api` — it comes from a second router
+  without the prefix. `desktop/src/lib/api.ts wsUrl()` is the only client.
 - All JSON request bodies are validated by Pydantic; unknown fields are ignored.
 - Operator identity is read from the optional `X-Operator` header (default
   `operator`, truncated to 64 characters). It is recorded on every operator
@@ -266,13 +271,13 @@ changes, so no restart is needed. `attribution` is what the style shows. Tested 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/missions?limit=30` | archived missions |
-| GET | `/api/missions/{id}` | mission record, plan, survivors, assignments, kits, events |
-| GET | `/api/missions/{id}/events?limit=500` | recorded events |
-| GET | `/api/missions/{id}/replay` | time-ordered replay frames |
-| GET | `/api/missions/{id}/analytics` | computed mission analytics |
-| POST | `/api/missions/{id}/report` | regenerate report from recorded data |
-| GET | `/api/missions/{id}/report` | report JSON |
-| GET | `/api/missions/{id}/report.pdf` | dependency-free PDF report |
+| GET | `/api/missions/{mission_id}` | mission record, plan, survivors, assignments, kits, events |
+| GET | `/api/missions/{mission_id}/events?limit=500` | recorded events |
+| GET | `/api/missions/{mission_id}/replay` | time-ordered replay frames |
+| GET | `/api/missions/{mission_id}/analytics` | computed mission analytics |
+| POST | `/api/missions/{mission_id}/report` | regenerate report from recorded data |
+| GET | `/api/missions/{mission_id}/report` | report JSON |
+| GET | `/api/missions/{mission_id}/report.pdf` | dependency-free PDF report |
 
 Reports are generated from evidence already on disk. Regenerating a report for
 an old mission never labels an inferred value as measured.

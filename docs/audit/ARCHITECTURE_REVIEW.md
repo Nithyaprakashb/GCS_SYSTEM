@@ -40,8 +40,9 @@ Two constraints dominate the architecture and are enforced in code, not in inten
   dependent on the station staying alive.
 
 **Sizes, counted at review time** — backend `rescueswarm/`: 29 modules, 10,752 lines.
-Frontend `desktop/src/`: 15 TypeScript/TSX modules, 5,325 lines. HTTP surface: 52 routes
-in one router. Tests: 118 across 11 files.
+Frontend `desktop/src/`: 15 TypeScript/TSX modules, 5,325 lines. HTTP surface: 53 endpoints
+over 50 distinct paths in one router, plus a WebSocket on a second router at `/ws`. Tests:
+118 across 11 files.
 
 ---
 
@@ -258,11 +259,13 @@ Persist transactions in a small `command_transactions` table written at SENT and
 settlement, and replay un-settled rows at startup into `UNKNOWN` with the reason recorded.
 This is an additive table; no state machine changes.
 
-**A-4 — one router, 52 routes, no versioning**
-`backend/rescueswarm/api.py` (684 lines) | All routes live in a single module under a
-single `/api` prefix. Nothing consumes the API but this repository's own renderer, so the
-absence of versioning costs little today; the size costs more — the file mixes transport
-concerns (host guard, `to_thread` offloading, `Response` construction) with 52 handlers. |
+**A-4 — one router, 53 endpoints, no versioning**
+`backend/rescueswarm/api.py` (684 lines) | All handlers live in a single module under a
+single `/api` prefix, while the WebSocket sits on a second router at `/ws` with no prefix at
+all — an inconsistency a new client has to know about rather than discover. Nothing consumes
+the API but this repository's own renderer, so the absence of versioning costs little today;
+the size costs more — the file mixes transport concerns (host guard, `to_thread` offloading,
+`Response` construction) with 50 distinct paths. |
 LOW today, MEDIUM as it grows | `BUILT` | Split by domain into `api_mission.py`,
 `api_video.py`, `api_map.py`, `api_records.py` behind the same router aggregation, and
 move the loopback/host guard into a middleware module. Pure relocation: no handler body
