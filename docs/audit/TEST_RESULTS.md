@@ -82,6 +82,19 @@ python tools/offline_map.py build --zooms 10-16
 - `python tools/offline_map.py build --zooms 10-16` re-run after the documentation pass, with
   the whole suite and the typechecker alongside it: **118 passed in 28.23 s**, `tsc --noEmit`
   exit 0. Same counts as §1.1; the two timings are two executions, not two results.
+- Per-file counts were re-executed rather than carried forward, which corrected two stale
+  numbers in this document (a claim of 9 read-back tests and 8 survivor-registry tests):
+
+  ```
+  test_command_lifecycle  24 passed in  1.87s
+  test_video_capture      13 passed in 17.88s
+  test_upload_readback    13 passed in  2.05s
+  test_survivor_registry  11 passed in  0.62s
+  test_offline_map        25 passed in  0.65s
+  test_station_shutdown    4 passed in  0.85s
+  test_threading           2 passed in  2.11s
+  ```
+
 - `docs/API.md` and `api.py` were diffed programmatically: **53 HTTP endpoints over 50 distinct
   paths** (`/api/missions/{mission_id}/report` is GET *and* POST) plus the WebSocket at `/ws`,
   all present in the document. The doc used `{id}` where the route declares `{mission_id}`;
@@ -143,7 +156,7 @@ number is what ships.
 | 3 | Lane planning, swath coverage, deterministic plan hash | passed | `CALCULATED` + `BUILT` — `test_plan_lanes_and_swath`, `test_plan_hash_is_deterministic` |
 | 4 | Preflight: unknown ≠ pass; blocking checks keep START locked | passed | `BUILT` |
 | 5 | Manual sign-offs cannot be auto-passed; SIMULATION batch sign-off is labelled | passed | `BUILT` |
-| 6 | Mission upload + per-item read-back diffing (waypoints, fence, params) | passed against the simulator | `SIMULATED`; **not yet physically verified** — 9 read-back tests in `test_upload_readback.py` |
+| 6 | Mission upload + per-item read-back diffing (waypoints, fence, params) | passed against the simulator | `SIMULATED`; **not yet physically verified** — 13 read-back tests in `test_upload_readback.py` |
 | 7 | Circle fence is never enabled without a radius | passed | `SIMULATED` — `test_fence_circle_is_never_enabled_without_a_radius` |
 | 8 | Read-back shorter than the upload is not "verified" | passed | `SIMULATED` — `test_read_back_shorter_than_the_upload_is_not_verified` |
 | 9 | A shifted or same-length-but-different mission is not verified | passed | `SIMULATED` — 2 tests |
@@ -156,7 +169,7 @@ number is what ships.
 | 16 | Release only from `HOVER_VERIFY`, only with hover verification | passed | `SIMULATED` |
 | 17 | Beam evidence requires an event id and a prior release; idempotent on replay | passed | `BUILT` — `test_beam_evidence_requires_an_event_id`, DB unique index |
 | 18 | Allocation: lowest ETA wins, one kit reserved; offline/no-kit aircraft rejected | passed | `SIMULATED` |
-| 19 | Survivor registry: capacity, non-finite confidence, absurd uncertainty, merge rules, no geotag tug-of-war | passed | `BUILT` — 8 tests in `test_survivor_registry.py` |
+| 19 | Survivor registry: capacity, non-finite confidence, absurd uncertainty, merge rules, no geotag tug-of-war | passed | `BUILT` — 11 tests in `test_survivor_registry.py` |
 | 20 | Safety: pad interlock, proximity warning, recall blocks release | passed | `SIMULATED` |
 | 21 | Abort reconciles kits and answers with a body | passed | `SIMULATED` + e2e run B |
 | 22 | Recall clears only the simulator it actually owns | passed | `SIMULATED` — `test_recall_clear_resumes_only_the_simulator` |
