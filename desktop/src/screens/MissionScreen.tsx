@@ -10,19 +10,54 @@ import {
   MapPin,
   Package,
   PlaneTakeoff,
+  Radio,
   Send,
   Sparkles,
 } from "lucide-react";
 import clsx from "clsx";
 import { api } from "../lib/api";
-import { batteryTone, fmtClock, fmtDistance, fmtTime, humanise, statusTone } from "../lib/format";
-import type { Assignment, DeliveryTask, Survivor, Vehicle } from "../lib/types";
+import { batteryTone, evidenceQuality, fmtClock, fmtDistance, fmtTime, humanise, qualityTone, statusTone, txMeaning, txTone } from "../lib/format";
+import type { Assignment, CommandTransaction, DeliveryTask, Survivor, Vehicle } from "../lib/types";
 import { AircraftGlyph, Badge, Empty, KV, Meter, Modal, Panel, ProgressRing } from "../components/ui";
 import { TacticalMap } from "../components/TacticalMap";
 import { VideoPanel } from "../components/VideoPanel";
 import { useGcs } from "../state/GcsContext";
 
-const PHASE_ORDER = ["QUEUED", "LAUNCHING", "TRANSIT", "HOLD_CLEARANCE", "DESCENT", "HOVER_VERIFY", "RELEASE_SENT", "CLIMB", "RETURNING", "LANDING", "STANDBY"];
+/**
+ * The delivery state machine, in the order the backend actually walks it
+ * (STATES/ALLOWED in backend/rescueswarm/delivery.py). Kept here as an explicit spine
+ * rather than a slice: the previous list dropped ACK_PENDING, CONFIRMED, UNKNOWN and
+ * ABORTED and had HOLD_CLEARANCE after TRANSIT, so a confirmed delivery rendered as an
+ * empty rail and an out-of-order one rendered as further along than it was.
+ *
+ * CONFIRMED and UNKNOWN occupy the same slot — they are the two possible outcomes of the
+ * break-beam check, not sequential steps. ABORTED is off-spine and handled separately.
+ */
+const DELIVERY_SPINE = [
+  "QUEUED", "LAUNCHING", "HOLD_CLEARANCE", "TRANSIT", "DESCENT", "HOVER_VERIFY",
+  "ACK_PENDING", "RELEASE_SENT", "CONFIRMED", "CLIMB", "RETURNING", "LANDING", "STANDBY",
+];
+const SPINE_SLOT: Record<string, number> = {
+  ...Object.fromEntries(DELIVERY_SPINE.map((state, i) => [state, i])),
+  UNKNOWN: DELIVERY_SPINE.indexOf("CONFIRMED"),
+};
+
+/**
+ * The three links of the command lifecycle that the rail shows. `verified` is drawn as its
+ * own segment precisely so that an accepted-but-unconfirmed command reads as an unfinished
+ * rail rather than as a closed one.
+ */
+const TX_STEPS = ["sent", "ack", "verified"] as const;
+
+function txStage(state: string): { stage: number; outcome: "open" | "ok" | "warn" | "fail" } {
+  const s = state.toUpperCase();
+  if (s === "VERIFIED" || s === "COMPLETED") return { stage: 3, outcome: "ok" };
+  if (s === "ACKNOWLEDGED") return { stage: 2, outcome: "open" };
+  if (s === "ACK_UNVERIFIED") return { stage: 2, outcome: "warn" };
+  if (["REJECTED", "TIMEOUT", "FAILED"].includes(s)) return { stage: 1, outcome: "fail" };
+  if (s === "CREATED") return { stage: 0, outcome: "open" };
+  return { stage: 1, outcome: "open" };
+}
 
 export function MissionScreen({ onOpenReplay }: { onOpenReplay: (missionId: string) => void }) {
   const { state } = useGcs();
@@ -51,6 +86,17 @@ export function MissionScreen({ onOpenReplay }: { onOpenReplay: (missionId: stri
     return Array.isArray(state.deliveries.tasks) ? state.deliveries.tasks : Object.values(state.deliveries.tasks);
   }, [state]);
   const assignments = state?.allocations.assignments ?? [];
+  // Command lifecycle, surfaced verbatim from the telemetry registry. The task badges above
+  // describe what the mission engine decided; these records describe what the aircraft
+  // actually answered, and the two must never be collapsed into one green tick.
+  const transactions = useMemo(() => {
+    if (!state) return [] as CommandTransaction[];
+    return Array.isArray(state.fleet.transactions) ? state.fleet.transactions : [];
+  }, [state]);
+  const unverifiedTx = useMemo(
+    () => transactions.filter((tx) => !["VERIFIED", "COMPLETED", "REJECTED", "TIMEOUT", "FAILED"].includes(tx.state.toUpperCase())),
+    [transactions],
+  );
 
   if (!state || !mission) {
     return <div className="empty" style={{ height: "100%" }}>Waiting for mission state…</div>;
@@ -63,7 +109,9 @@ export function MissionScreen({ onOpenReplay }: { onOpenReplay: (missionId: stri
   // operator-facing timer must show the same clock rather than wall time.
   const simElapsed = mission.simulation && mission.simulation.sim_time_s > 0 ? mission.simulation.sim_time_s : null;
   const elapsed = simElapsed ?? wallElapsed;
-  const timeCap = 30 * 60;
+  // Read the cap the engine enforces instead of printing a constant: a profile with a
+  // different time_cap_min used to show a countdown to a limit that was never in force.
+  const timeCap = (mission.time_cap_min ?? 30) * 60;
   const timerTone = elapsed > timeCap * 0.9 ? "danger" : elapsed > timeCap * 0.75 ? "warn" : "";
   const online = vehicles.filter((vehicle) => vehicle.connected).length;
   const activeTask = (callsign: string) => tasks.find((task) => task.callsign === callsign && !["STANDBY", "CONFIRMED", "UNKNOWN", "ABORTED"].includes(task.state));
@@ -125,7 +173,7 @@ export function MissionScreen({ onOpenReplay }: { onOpenReplay: (missionId: stri
         <div className="timer-block">
           <div>
             <div className={`timer ${timerTone}`}>{fmtTime(elapsed)}</div>
-            <div className="micro">{simElapsed !== null ? "Simulated elapsed · cap 30:00" : "Mission elapsed · cap 30:00"}</div>
+            <div className="micro">{simElapsed !== null ? `Simulated elapsed · cap ${fmtTime(timeCap)}` : `Mission elapsed · cap ${fmtTime(timeCap)}`}</div>
           </div>
           <ProgressRing value={(elapsed / timeCap) * 100} colour={timerTone === "danger" ? "var(--danger)" : timerTone === "warn" ? "var(--warn)" : "var(--accent)"} />
         </div>
@@ -139,7 +187,7 @@ export function MissionScreen({ onOpenReplay }: { onOpenReplay: (missionId: stri
             ))}
           </div>
           <div className="micro" style={{ color: "var(--faint)" }}>
-            {online}/3 linked · {state.video.live_count}/3 video ·{" "}
+            {online}/{vehicles.length} linked · {state.video.live_count}/{state.video.total} video ·{" "}
             {state.kits.counts.LOADED ?? 0} kits loaded
           </div>
         </div>
@@ -151,8 +199,8 @@ export function MissionScreen({ onOpenReplay }: { onOpenReplay: (missionId: stri
             SIM {mission.simulation.speed}× · T+{fmtTime(mission.simulation.sim_time_s)}
           </div>
         )}
-        <Badge tone={state.video.recording_count === 3 ? "ok" : "muted"} dot pulse={state.video.recording_count > 0}>
-          {state.video.recording_count}/3 recording
+        <Badge tone={state.video.recording_count === state.video.total && state.video.total > 0 ? "ok" : "muted"} dot pulse={state.video.recording_count > 0}>
+          {state.video.recording_count}/{state.video.total} recording
         </Badge>
         {mission.phase === "COMPLETE" && mission.mission_id && (
           <button className="btn sm" onClick={() => onOpenReplay(mission.mission_id as string)}>
@@ -198,9 +246,70 @@ export function MissionScreen({ onOpenReplay }: { onOpenReplay: (missionId: stri
                       <span>{task.kit_id}</span>
                       {task.beam_result && <span>beam: {task.beam_result}</span>}
                     </div>
-                    <PhaseRail state={task.state} />
+                    <PhaseRail state={task.state} beam={task.beam_result} />
                   </div>
                 ))}
+              </div>
+            )}
+            {tasks.length > 0 && (
+              <div className="micro" style={{ color: "var(--faint)", lineHeight: 1.5, padding: "7px 8px 2px" }}>
+                Rail = delivery sequence. The amber segment at the release step means the kit
+                left the magazine with no break-beam evidence — the aircraft moving on is not
+                proof of delivery.
+              </div>
+            )}
+          </Panel>
+
+          <Panel
+            title="Command lifecycle"
+            icon={<Radio size={13} />}
+            bodyClass="tight"
+            actions={
+              <Badge tone={unverifiedTx.length ? "info" : "muted"} style={{ height: 20, fontSize: 8.5 }} title={unverifiedTx.length ? "commands awaiting a vehicle-state check" : "no command is mid-flight on the link"}>
+                {unverifiedTx.length} unverified
+              </Badge>
+            }
+          >
+            <div className="micro" style={{ color: "var(--faint)", lineHeight: 1.5, marginBottom: 7 }}>
+              sent → acknowledged → state verified. An ACK is the autopilot answering, not proof
+              that the aircraft did it; only the third segment closes on verification.
+            </div>
+            {transactions.length === 0 ? (
+              <Empty>No command transmitted on this link session.</Empty>
+            ) : (
+              <div style={{ maxHeight: 260, overflow: "auto" }}>
+                {[...transactions].reverse().slice(0, 14).map((tx) => (
+                  <div className="tx-row" key={tx.tx_id}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 7, alignItems: "center" }}>
+                      <span className="mono" style={{ fontSize: 10, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={`${tx.label} · ${tx.tx_id}`}>
+                        {tx.callsign} · {tx.label}
+                      </span>
+                      <Badge tone={txTone(tx.state)} title={txMeaning(tx.state)} style={{ height: 17, fontSize: 7.5, padding: "0 5px", flexShrink: 0 }}>
+                        {humanise(tx.state)}
+                      </Badge>
+                    </div>
+                    <TxRail state={tx.state} />
+                    <div className="allocation-meta" style={{ marginTop: 3 }}>
+                      <span>{fmtClock(tx.created_at)}</span>
+                      <span>cmd {tx.command}</span>
+                      {tx.attempts > 1 && <span>{tx.attempts} attempts</span>}
+                      {tx.simulated && <span style={{ color: "var(--info)" }}>simulated link</span>}
+                      {tx.ack_result !== null && tx.ack_result !== 0 && <span>MAV_RESULT {tx.ack_result}</span>}
+                      {tx.expectation === null && ["ACKNOWLEDGED", "VERIFIED"].includes(tx.state) && (
+                        <span>no state check defined</span>
+                      )}
+                    </div>
+                    {tx.detail && (
+                      <div className="micro" style={{ color: "var(--muted)", lineHeight: 1.4, marginTop: 2 }}>{tx.detail}</div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+            {transactions.length >= 100 && (
+              <div className="micro" style={{ color: "var(--warn)", marginTop: 6 }}>
+                Showing the latest 14 of the last 100 transactions. The full command trail is in
+                the local evidence log, not this panel.
               </div>
             )}
           </Panel>
@@ -213,6 +322,7 @@ export function MissionScreen({ onOpenReplay }: { onOpenReplay: (missionId: stri
             vehicles={state.fleet.vehicles}
             survivors={survivors}
             safety={state.safety}
+            provenance={evidenceQuality(state)}
             onSelectSurvivor={(survivor) => setSelected(survivor)}
             onExpand={() => setMapOpen(true)}
           />
@@ -278,7 +388,7 @@ export function MissionScreen({ onOpenReplay }: { onOpenReplay: (missionId: stri
                 <KV k="Drop point" v={`${selected.drop_lat.toFixed(5)}, ${selected.drop_lon.toFixed(5)}`} />
                 <KV k="Confidence" v={`${((selected.confidence ?? 0) * 100).toFixed(0)}%`} />
                 <KV k="Observations" v={String(selected.observations ?? "—")} />
-                <KV k="Evidence" v={selected.data_quality ?? "SIMULATED"} />
+                <KV k="Evidence" v={selected.data_quality ?? "UNKNOWN"} />
                 {selected.note && <div className="small muted" style={{ marginTop: 4 }}>{selected.note}</div>}
               </div>
             )}
@@ -376,6 +486,7 @@ export function MissionScreen({ onOpenReplay }: { onOpenReplay: (missionId: stri
             vehicles={state.fleet.vehicles}
             survivors={survivors}
             safety={state.safety}
+            provenance={evidenceQuality(state)}
             onSelectSurvivor={setSelected}
           />
         </div>
@@ -411,8 +522,16 @@ function AircraftCard({ vehicle, task }: { vehicle: Vehicle; task?: DeliveryTask
             <Badge tone={vehicle.connected && !vehicle.stale ? "ok" : vehicle.connected ? "warn" : "danger"} style={{ height: 17, fontSize: 7.5, padding: "0 5px" }}>
               {vehicle.connected ? (vehicle.stale ? "STALE" : "LINK") : "LOST"}
             </Badge>
+            {/* Provenance belongs on the aircraft card: a simulated value must never share
+                a colour with a heartbeat, whatever the mission mode banner says. */}
+            {vehicle.data_quality && vehicle.data_quality !== "LIVE" && (
+              <Badge tone={qualityTone(vehicle.data_quality)} style={{ height: 17, fontSize: 7.5, padding: "0 5px" }}
+                title={`These readings are ${humanise(vehicle.data_quality)}: ${vehicle.data_quality === "SIMULATED" ? "produced by the engineering simulator, not by this aircraft" : "of unproven origin"}`}>
+                {vehicle.data_quality}
+              </Badge>
+            )}
           </div>
-          <div className="aircraft-role">{vehicle.role === "SEARCH" ? "Search · YOLOv8n" : "Delivery · 5-kit magazine"}</div>
+          <div className="aircraft-role">{vehicle.role === "SEARCH" ? "Search · optical survey" : "Delivery · kit magazine"}</div>
         </div>
         <div style={{ textAlign: "right" }}>
           <div className="mono" style={{ fontSize: 11, fontWeight: 600 }}>{vehicle.battery_pct !== null ? `${vehicle.battery_pct.toFixed(0)}%` : "—"}</div>
@@ -428,7 +547,22 @@ function AircraftCard({ vehicle, task }: { vehicle: Vehicle; task?: DeliveryTask
         <div className="m"><span>GS</span><span>{vehicle.groundspeed_ms !== null ? `${vehicle.groundspeed_ms.toFixed(1)} m/s` : "—"}</span></div>
         <div className="m"><span>Task</span><span>{vehicle.task}</span></div>
         <div className="m"><span>Kits</span><span>{vehicle.role === "DELIVERY" ? vehicle.kits_free : "—"}</span></div>
-        <div className="m"><span>Link</span><span>{vehicle.link_quality !== null ? `${vehicle.link_quality}%` : "—"}</span></div>
+        {/* Link per-cent is a radio statistic; the heartbeat age is what says whether this
+            row is a current truth or a memory. Shown together, never as one number. */}
+        <div
+          className="m"
+          title={vehicle.heartbeat_age_s !== null && vehicle.heartbeat_age_s !== undefined
+            ? `Last heartbeat ${vehicle.heartbeat_age_s.toFixed(1)} s ago · RSSI ${vehicle.rssi ?? "—"} dBm`
+            : "No heartbeat received on this station"}
+        >
+          <span>Link</span>
+          <span>
+            {vehicle.link_quality !== null ? `${vehicle.link_quality}%` : "—"}
+            {vehicle.heartbeat_age_s !== null && vehicle.heartbeat_age_s !== undefined
+              ? ` · hb ${vehicle.heartbeat_age_s.toFixed(1)}s`
+              : ""}
+          </span>
+        </div>
         <div className="m"><span>GPS</span><span>{vehicle.gps_fix >= 3 ? `${vehicle.gps_sats} sats` : "no fix"}</span></div>
       </div>
       {task && (
@@ -443,19 +577,61 @@ function AircraftCard({ vehicle, task }: { vehicle: Vehicle; task?: DeliveryTask
   );
 }
 
-function PhaseRail({ state }: { state: string }) {
-  const index = PHASE_ORDER.indexOf(state);
+function PhaseRail({ state, beam }: { state: string; beam?: string | null }) {
+  const s = (state || "").toUpperCase();
+  const aborted = s === "ABORTED";
+  const index = SPINE_SLOT[s] ?? -1;
+  // The release slot reports what the break-beam actually said, not what the machine hoped
+  // for: a task that has already climbed away with no beam evidence still shows an amber
+  // release segment, because "the aircraft moved on" is not "the kit was delivered".
+  const releaseProven = s === "CONFIRMED" || beam === "CONFIRMED";
+  const label = aborted
+    ? "Delivery aborted · off the normal sequence"
+    : index < 0
+      ? `Phase ${s || "unknown"} is not in the recorded sequence`
+      : `${humanise(s)} · step ${index + 1} of ${DELIVERY_SPINE.length}`;
   return (
-    <div style={{ display: "flex", gap: 2, marginTop: 6 }}>
-      {PHASE_ORDER.slice(0, 9).map((phase, i) => (
+    <div
+      className="phase-rail"
+      role="img"
+      aria-label={`Delivery progress: ${label}. Segments: ${DELIVERY_SPINE.map(humanise).join(", ")}.`}
+      title={label}
+    >
+      {DELIVERY_SPINE.map((phase, i) => {
+        const reached = index >= 0 && i <= index;
+        let colour = "var(--line-strong)";
+        if (aborted) colour = i === 0 ? "var(--danger)" : "var(--line-strong)";
+        else if (phase === "CONFIRMED" && reached) colour = releaseProven ? "var(--ok)" : "var(--warn)";
+        else if (reached) colour = "var(--accent)";
+        return (
+          <span
+            key={phase}
+            title={`${humanise(phase)}${phase === "CONFIRMED" && reached ? (releaseProven ? " · break-beam confirmed" : " · no delivery evidence") : ""}`}
+            style={{ background: colour }}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * Command lifecycle for one transmitted MAVLink command: sent → acknowledged → vehicle state
+ * verified. The third segment stays open on an ACK, because an autopilot acceptance is proof
+ * that the command was received, not proof that the aircraft did it.
+ */
+function TxRail({ state }: { state: string }) {
+  const { stage, outcome } = txStage(state);
+  const colour = outcome === "ok" ? "var(--ok)" : outcome === "fail" ? "var(--danger)" : outcome === "warn" ? "var(--warn)" : "var(--accent)";
+  return (
+    <div className="phase-rail" role="img" aria-label={`Command lifecycle: ${humanise(state)} — ${txMeaning(state)}`} title={txMeaning(state)}>
+      {TX_STEPS.map((step, i) => (
         <span
-          key={phase}
-          title={humanise(phase)}
+          key={step}
+          title={`${humanise(step)}${step === "verified" && stage < 3 ? " · not reached" : ""}`}
           style={{
-            flex: 1,
-            height: 2,
-            borderRadius: 2,
-            background: index >= i && index >= 0 ? "var(--accent)" : "var(--line-strong)",
+            background: i < stage ? colour : "var(--line-strong)",
+            opacity: i === stage - 1 && outcome === "open" && stage < 3 ? 0.6 : 1,
           }}
         />
       ))}

@@ -319,6 +319,7 @@ export function ReplayScreen({ initialMissionId }: { initialMissionId?: string |
               aircraftOverride={positions}
               trails={trails}
               survivors={replaySurvivors}
+              provenance="RECORDED"
               className="fill"
             />
           </div>
@@ -429,7 +430,22 @@ export function ReplayScreen({ initialMissionId }: { initialMissionId?: string |
         </div>
       </div>
 
-      <Modal open={reportOpen} onClose={() => setReportOpen(false)} title="Report rebuild" footer={<a className="btn primary" href={missionId ? `/api/missions/${missionId}/report.pdf` : "#"} download>Download PDF</a>}>
+      <Modal
+        open={reportOpen}
+        onClose={() => setReportOpen(false)}
+        title="Report rebuild"
+        footer={
+          missionId ? (
+            <a className="btn primary" href={`/api/missions/${missionId}/report.pdf`} download>
+              Download PDF
+            </a>
+          ) : (
+            /* A dead <a href="#"> styled as a primary button is a placeholder control: it looks
+              armed, fires nothing and teaches the operator that this screen lies. */
+            <span className="small muted">Select a mission to download its report.</span>
+          )
+        }
+      >
         <p className="modal-text">
           The report has been regenerated from recorded events, telemetry and decisions. Calculated values remain
           labelled CALCULATED and simulated evidence remains labelled SIMULATED.

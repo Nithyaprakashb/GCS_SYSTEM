@@ -33,7 +33,10 @@
       "battery_low_pct": 28.0,
       "battery_critical_pct": 16.0,
       "kits": 5,
-      "kit_prefix": "DEL-01-K"
+      "kit_prefix": "DEL-01-K",
+      "release_servo_channel": 9,
+      "release_pwm": 1900,
+      "payload_hardware_verified": false
     },
     {
       "callsign": "DEL-02",
@@ -48,7 +51,10 @@
       "battery_low_pct": 28.0,
       "battery_critical_pct": 16.0,
       "kits": 5,
-      "kit_prefix": "DEL-02-K"
+      "kit_prefix": "DEL-02-K",
+      "release_servo_channel": 9,
+      "release_pwm": 1900,
+      "payload_hardware_verified": false
     }
   ],
   "telemetry": {
@@ -65,7 +71,10 @@
     "heartbeat_timeout_s": 3.0,
     "stale_after_s": 2.0,
     "command_timeout_s": 2.5,
-    "command_retries": 2,
+    "state_verify_s": 6.0,
+    "upload_timeout_s": 20.0,
+    "readback_timeout_s": 20.0,
+    "param_timeout_s": 8.0,
     "radio_firmware": null,
     "radio_hardware_revision": null,
     "radio_region": "IN — unverified"
@@ -128,6 +137,7 @@
     ],
     "sim_fps": 6,
     "freeze_timeout_s": 2.0,
+    "no_frame_timeout_s": 8.0,
     "black_luma_threshold": 12.0,
     "recordings_dir": "video",
     "required_for_readiness": true

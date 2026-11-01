@@ -14,6 +14,32 @@ interface MapProps {
   onSelectSurvivor?: (survivor: Survivor) => void;
   onExpand?: () => void;
   className?: string;
+  /**
+   * Where the shapes on this map came from. A replay of a simulated sortie and a live
+   * sortie otherwise look identical, and a screenshot of one has no business being
+   * read as the other.
+   *
+   * Pass the quality straight out of the telemetry (`evidenceQuality` in lib/format),
+   * not a value derived from the mode label — a REAL session whose links all dropped
+   * has no live evidence, and calling it SIMULATED would be a different lie.
+   */
+  provenance?: string;
+}
+
+/**
+ * The chip has to say what the fleet data actually is, so every quality the backend can
+ * publish needs its own wording. Collapsing anything that is not LIVE into "SIMULATED"
+ * would tell an operator watching a dropped or half-lost link that the map is a
+ * simulation, which is the wrong alarm and hides the right one.
+ */
+function provenanceChip(quality: string): { label: string; color: string } {
+  const isMixed = quality.startsWith("MIXED");
+  if (quality === "LIVE") return { label: "LIVE TELEMETRY", color: "var(--ok)" };
+  if (quality === "RECORDED") return { label: "RECORDED — NOT A LIVE LINK", color: "var(--warn)" };
+  if (quality === "SIMULATED") return { label: "SIMULATED — NOT FLIGHT DATA", color: "var(--accent)" };
+  if (quality === "NO TELEMETRY") return { label: "NO TELEMETRY — PLANNED GEOMETRY ONLY", color: "var(--danger)" };
+  if (isMixed) return { label: `TELEMETRY ${quality}`, color: "var(--warn)" };
+  return { label: `TELEMETRY ${quality}`, color: "var(--danger)" };
 }
 
 function ringToCoords(ring: [number, number][] | undefined): [number, number][] {
@@ -60,6 +86,7 @@ export function TacticalMap({
   onSelectSurvivor,
   onExpand,
   className,
+  provenance,
 }: MapProps) {
   const container = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
@@ -423,6 +450,14 @@ export function TacticalMap({
           <span className="map-chip">
             <Layers size={12} /> Local tiles · no internet
           </span>
+          {provenance && (() => {
+            const chip = provenanceChip(provenance);
+            return (
+              <span className="map-chip" style={{ color: chip.color, borderColor: "currentColor" }}>
+                {chip.label}
+              </span>
+            );
+          })()}
           {area && <span className="map-chip mono">{area.toFixed(3)} ha</span>}
           {padClear !== undefined && (
             <span className="map-chip" style={{ color: padClear ? "var(--ok)" : "var(--danger)" }}>

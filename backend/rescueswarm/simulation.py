@@ -23,7 +23,7 @@ from .db import Database
 from .delivery import DeliveryEngine
 from .events import EventBus
 from .geo import bearing_deg, destination_m, haversine_m, LocalFrame
-from .ledger import KitLedger
+from .ledger import KitLedger, LedgerError
 from .safety import SafetyEngine
 from .survivors import SurvivorRegistry
 from .telemetry import TelemetryManager
@@ -73,6 +73,7 @@ class SimulationEngine:
         self.aircraft: dict[str, dict[str, Any]] = {}
         self.targets: list[dict[str, Any]] = []
         self._beam_queue: list[tuple[float, str]] = []
+        self._beam_seq = 0
         self._duplicate_due: float | None = None
         self._completion_sent = False
         self._recall_issued = False
@@ -139,7 +140,7 @@ class SimulationEngine:
         self.bench = True
         self.running = True
         self._apply_telemetry()
-        self._task = asyncio.create_task(self._run())
+        self._schedule_run()
         self.bus.publish(
             "simulation.bench",
             {"state": "AT_PAD", "aircraft": len(self.aircraft),
@@ -163,6 +164,7 @@ class SimulationEngine:
         self.link_lost.clear()
         self.forced_beam.clear()
         self._beam_queue.clear()
+        self._beam_seq = 0
         self._duplicate_due = None
         self._last_publish = 0.0
         pad = plan["pad"]
@@ -176,7 +178,7 @@ class SimulationEngine:
         self._targets_from_aoi(aoi)
         self.running = True
         self._apply_telemetry()
-        self._task = asyncio.create_task(self._run())
+        self._schedule_run()
         self.bus.publish(
             "simulation.started",
             {"speed": self.speed, "survivors_planted": len(self.targets),
@@ -184,6 +186,35 @@ class SimulationEngine:
             severity="warning", source="SIMULATION", data_quality="SIMULATED",
         )
         return self.snapshot()
+
+    def _schedule_run(self) -> None:
+        """Put the flight loop on an event loop, from whichever thread asked for it.
+
+        The mission endpoints run in worker threads (`asyncio.to_thread`) so that opening
+        recorders cannot delay an abort. `asyncio.create_task` there has no running loop:
+        it raises, the coroutine is never awaited, and a simulated sortie sits at
+        EXECUTING with nothing flying it — a silent, total loss of the simulation path.
+        """
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not None:
+            self._task = running.create_task(self._run())
+            return
+        loop = self.bus.bound_loop()
+        if loop is None or not loop.is_running():
+            self.running = False
+            raise RuntimeError(
+                "No station event loop is available to run the simulated sortie"
+            )
+        loop.call_soon_threadsafe(self._spawn_on_loop, loop)
+
+    def _spawn_on_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        if not self.running:
+            # Stopped between the request and this callback; do not resurrect the loop.
+            return
+        self._task = loop.create_task(self._run())
 
     def stop(self) -> None:
         if self._task and not self._task.done():
@@ -660,7 +691,23 @@ class SimulationEngine:
                 beam = "NO_BEAM" if self._rng.random() < 0.7 else "SENSOR_FAULT"
             else:
                 beam = "CONFIRMED"
-            self.delivery.apply_beam_result(assignment_id, beam)
+            # A real magazine firmware stamps each break-beam report with a unique id.
+            # The simulator does the same so the evidence path is exercised end to end
+            # and no delivery can settle on an unattributable event.
+            self._beam_seq += 1
+            event_id = f"SIM-BEAM-{self._beam_seq:05d}"
+            try:
+                result = self.delivery.apply_beam_result(assignment_id, beam, event_id=event_id)
+            except LedgerError as exc:
+                result = {"accepted": False, "confirmed": False, "reason": str(exc)}
+            self.bus.publish(
+                "payload.beam_event",
+                {"assignment_id": assignment_id, "kit_id": task["kit_id"],
+                 "callsign": task["callsign"], "beam_result": beam, "event_id": event_id,
+                 "accepted": result.get("accepted", True)},
+                severity="info" if result.get("accepted", True) else "critical",
+                source=task["callsign"], data_quality="SIMULATED",
+            )
             aircraft = self.aircraft.get(task["callsign"])
             if aircraft:
                 self._safe_transition(assignment_id, "CLIMB", f"Beam {beam}")
@@ -745,6 +792,29 @@ class SimulationEngine:
                     self._set_phase(ac, "RETURN", "Emergency recall")
         self.bus.publish("simulation.recall", {"reason": reason},
                          severity="critical", source="SIMULATION", data_quality="SIMULATED")
+
+    def clear_recall(self) -> None:
+        """Bench-only: the operator resolved the recall condition, resume the model.
+
+        Real aircraft in RTL are not recalled by this call — the GCS never owns onboard
+        autonomy — so this exists solely to let a simulated sortie continue after a
+        recall drill.
+        """
+        with self._lock:
+            self.recall_active = False
+            self.recall_reason = ""
+            self._recall_issued = False
+            for ac in self.aircraft.values():
+                ac["recall"] = False
+                if ac["role"] == "SEARCH" and ac["phase"] == "RETURN":
+                    ac["phase"] = "SEARCH"
+                    ac["mode"] = "AUTO"
+                    ac["task"] = "SEARCH"
+        self.bus.publish(
+            "simulation.recall_cleared",
+            {"running": self.running, "sim_time_s": round(self.sim_time_s, 1)},
+            source="SIMULATION", data_quality="SIMULATED",
+        )
 
     def abort(self, reason: str) -> None:
         self.aborted = True

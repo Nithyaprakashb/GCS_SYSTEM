@@ -36,15 +36,45 @@ export interface Vehicle {
   statustext: string;
 }
 
+/**
+ * One MAVLink command as the ground station tracked it. Mirrors
+ * `CommandTransaction.to_dict()` in backend/rescueswarm/telemetry.py.
+ *
+ * `state` is the communication lifecycle, not the task lifecycle:
+ *   CREATED → SENT → ACKNOWLEDGED → VERIFIED
+ * with REJECTED / TIMEOUT / ACK_UNVERIFIED as non-completing outcomes.
+ * VERIFIED is the only state that means the aircraft actually reached the
+ * commanded condition.
+ */
+export interface CommandTransaction {
+  tx_id: string;
+  callsign: string;
+  command: number;
+  label: string;
+  state: "CREATED" | "SENT" | "RETRYING" | "ACKNOWLEDGED" | "VERIFIED" | "REJECTED" | "TIMEOUT" | "ACK_UNVERIFIED" | string;
+  created_at: string;
+  updated_at: string;
+  attempts: number;
+  ack_result: number | null;
+  detail: string;
+  simulated: boolean;
+  expectation: Record<string, unknown> | null;
+  ack_at: string | null;
+  verified_at: string | null;
+}
+
 export interface FleetSnapshot {
   mode: Mode | "OFFLINE";
   connected: boolean;
   vehicles: Record<string, Vehicle> | Vehicle[];
-  topology?: {
-    mode?: string;
-    verified?: boolean;
-    note?: string;
-  };
+  /** Configured RFD868x wiring: "shared" or "independent". A setting, not a measurement. */
+  topology?: string;
+  /** UNVERIFIED | VERIFIED_SIMULATION — what this session actually proved. */
+  topology_status?: string;
+  /** True only after the physical commissioning of the link, recorded out of band. */
+  topology_commissioned?: boolean;
+  /** Command lifecycle records — the evidence that a command was answered, not that it worked. */
+  transactions?: CommandTransaction[];
   policy?: string;
 }
 
@@ -144,7 +174,11 @@ export interface VideoFeed {
   fps?: number | null;
   frames_received?: number;
   frame_age_ms?: number | null;
+  /** Seconds a started pipeline has been waiting for its first frame; null once frames exist. */
+  no_frame_s?: number | null;
   latency_estimate_ms?: number | null;
+  /** Why latency is or is not a number: never show a link delay that was not measured. */
+  latency_basis?: string;
   frozen_s?: number;
   black?: boolean;
   luma?: number | null;
@@ -160,6 +194,8 @@ export interface VideoHealth {
   feeds: VideoFeed[];
   live_count: number;
   total: number;
+  /** Mapped feeds that are up but have never produced a frame. */
+  waiting_count?: number;
   recording_count: number;
   policy?: string;
 }
@@ -207,6 +243,11 @@ export interface MissionPlan {
     search_time_s?: number;
     lanes: { lat: number; lon: number }[][];
     long_axis_deg?: number;
+    /** Search altitude and speed the lanes were flown at, as computed by the planner. */
+    altitude_m?: number;
+    speed_ms?: number;
+    /** Inset the lanes were pulled inside the boundary, in metres. */
+    lane_inset_m?: number;
     evidence?: string;
   };
   estimate?: {
@@ -214,6 +255,20 @@ export interface MissionPlan {
     total_min_low?: number;
     total_min_high?: number;
     label?: string;
+    /**
+     * The numbers the planner actually flew its arithmetic on. The setup screens read
+     * these instead of repeating literals, so a profile change cannot leave the UI
+     * advertising a limit the safety rules no longer enforce.
+     */
+    inputs?: {
+      search_altitude_m?: number;
+      search_speed_ms?: number;
+      turn_time_s?: number;
+      lane_inset_m?: number;
+      delivery_speed_ms?: number;
+      service_time_s?: number;
+    };
+    evidence?: string;
     [key: string]: unknown;
   };
   energy?: Record<string, unknown>;
@@ -229,6 +284,11 @@ export interface Geofence {
   polygon?: [number, number][];
   ring?: [number, number][];
   type?: string;
+  /** Ceiling the fence admits for this aircraft, from its profile RTL/transit altitude. */
+  max_alt_m?: number;
+  action?: string;
+  gcs_warning_margin_m?: number;
+  fence_margin_m?: number;
   [key: string]: unknown;
 }
 
@@ -252,6 +312,15 @@ export interface MissionStatus {
   started_at: string | null;
   ended_at: string | null;
   elapsed_s: number;
+  /** The cap the backend engine enforces, read from the fleet profile. */
+  time_cap_min?: number;
+  /** Separation and capacity limits the safety rules actually read, from the profile. */
+  limits?: {
+    descent_clearance_m?: number;
+    merge_distance_m?: number;
+    proximity_warn_m?: number;
+    max_survivors?: number;
+  };
   recall: boolean;
   aoi: Aoi | null;
   plan: MissionPlan | null;

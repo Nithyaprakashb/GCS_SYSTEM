@@ -62,7 +62,21 @@ class VideoFeed:
     source: str = "NONE"
     latency_estimate_ms: float | None = None
     frames_received: int = 0
+    # Cumulative frames stay on the operator's screen; the fps estimate needs a
+    # windowed counter, and reusing one field for both made the total reset every
+    # health pass.
+    window_frames: int = 0
     dropped: int = 0
+    # Why latency is or is not a number. The GCS cannot see the far end of an analog
+    # link: TX800 glass-to-glass delay needs a timing pattern and a camera on the
+    # ground, which has never been done here. It is reported, never invented.
+    latency_basis: str = "NOT_MEASURED"
+    # When the capture thread for this feed was launched. The stall detector needs a
+    # first frame to measure an age against, so a pipeline that never produced one had
+    # no age at all and looked healthy forever. This gives the zero-frame case a clock.
+    started_mono: float = 0.0
+    # The zero-frame alarm fires once per capture session, not once per health pass.
+    no_frame_event: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -85,8 +99,13 @@ class VideoFeed:
             "source": self.source,
             "latency_estimate_ms": round(self.latency_estimate_ms, 0)
             if self.latency_estimate_ms is not None else None,
+            "latency_basis": self.latency_basis,
             "frames_received": self.frames_received,
             "dropped": self.dropped,
+            # Seconds a mapped feed has been waiting for its very first frame. None once
+            # a frame exists — at that point frame_age_ms tells the real story.
+            "no_frame_s": round(time.monotonic() - self.started_mono, 1)
+            if self.started_mono and not self.frames_received else None,
             "stream_url": f"/api/video/{self.callsign}/stream",
             "still_url": f"/api/video/{self.callsign}/frame.jpg",
         }
@@ -110,9 +129,17 @@ class VideoManager:
         self.feeds: dict[str, VideoFeed] = {}
         self.latest: dict[str, bytes] = {}
         self._lock = threading.RLock()
+        # Separates "start/stop the capture machinery" from "read the latest frame". The
+        # plain lock is a lifecycle token, not a data guard, and is deliberately not
+        # reentrant: a start that reaches for it twice is a bug, not a nesting quirk.
+        self._lifecycle_lock = threading.Lock()
         self._threads: dict[str, threading.Thread] = {}
         self._stop = threading.Event()
         self._recorders: dict[str, Any] = {}
+        # video_sessions row id per open recording, so closing a recorder can stamp the
+        # same audit row it opened rather than leaving an orphan with no end_time.
+        self._session_rows: dict[str, int] = {}
+        self._recorded_frames: dict[str, int] = {}
         self._processes: dict[str, subprocess.Popen] = {}
         self._health_thread: threading.Thread | None = None
         self._injected: dict[str, str | None] = {}
@@ -136,15 +163,26 @@ class VideoManager:
             self.feeds[feed.callsign] = feed
 
     def start(self, mode: str) -> dict[str, Any]:
-        self.stop()
+        # /video/start runs in a worker thread while /video/stop and station shutdown run on
+        # the event loop. Without one lifecycle token shared between them, a capture spawned
+        # just after the other call cleared the table is never terminated: the orphan keeps
+        # the DirectShow device and keeps writing to the recorder.
+        with self._lifecycle_lock:
+            return self._start_locked(mode)
+
+    def _start_locked(self, mode: str) -> dict[str, Any]:
+        self._stop_locked()
         self.mode = mode
         self._init_feeds()
         self._stop.clear()
         if mode == "SIMULATION":
             for callsign, feed in self.feeds.items():
                 feed.mapped = True
-                feed.status = "LIVE"
-                feed.message = "Synthetic optical feed"
+                # Not "LIVE" yet. The status becomes LIVE when the loop has actually put a
+                # frame on screen, so a stalled synthetic feed cannot pass preflight.
+                feed.status = "NO_SIGNAL"
+                feed.message = "Synthetic feed starting; no frame yet"
+                feed.started_mono = time.monotonic()
                 thread = threading.Thread(target=self._sim_loop, args=(callsign,), daemon=True,
                                           name=f"video-sim-{callsign}")
                 self._threads[callsign] = thread
@@ -152,15 +190,25 @@ class VideoManager:
             self.bus.publish("video.health", self.health(), source="VIDEO", data_quality="SIMULATED")
         else:
             devices = self.discover_capture_devices()
+            claimed: set[str] = set()
             for feed in self.feeds.values():
                 match = next(
                     (d for d in devices if feed.device_fingerprint and d["name"] == feed.device_fingerprint),
                     None,
                 )
+                if match and match["name"] in claimed:
+                    # A DirectShow source is exclusive: a second opener either fails or
+                    # silently steals the feed from the aircraft already using it.
+                    feed.mapped = False
+                    feed.status = "UNMAPPED"
+                    feed.message = "Capture device is already claimed by another feed"
+                    continue
                 feed.mapped = match is not None
                 if match:
+                    claimed.add(match["name"])
                     feed.status = "NO_SIGNAL"
                     feed.message = "Capture configured; starting"
+                    feed.started_mono = time.monotonic()
                     thread = threading.Thread(
                         target=self._ffmpeg_loop, args=(feed.callsign, match["name"]), daemon=True,
                         name=f"video-{feed.callsign}",
@@ -176,23 +224,72 @@ class VideoManager:
             self._health_thread.start()
         return self.health()
 
-    def stop(self) -> None:
+    def stop(self) -> dict[str, Any]:
+        """Close every capture and recorder process this manager owns.
+
+        The shell depends on this being real: a GCS that is killed while ffmpeg still
+        holds the DirectShow device leaves the camera unusable until the station is
+        rebooted, and an orphaned recorder keeps appending frames after the sortie.
+        """
+        with self._lifecycle_lock:
+            return self._stop_locked()
+
+    def _stop_locked(self) -> dict[str, Any]:
         self._stop.set()
-        for feed_id, process in list(self._processes.items()):
+        closed_processes = 0
+        for callsign, process in list(self._processes.items()):
             try:
                 process.terminate()
             except Exception:
                 pass
+            try:
+                process.wait(timeout=2.0)
+                closed_processes += 1
+            except Exception:
+                try:
+                    process.kill()
+                    closed_processes += 1
+                except Exception:
+                    pass
         self._processes.clear()
+        joined = 0
         for thread in list(self._threads.values()):
-            thread.join(timeout=1.0)
+            thread.join(timeout=1.5)
+            if not thread.is_alive():
+                joined += 1
         self._threads.clear()
+        if self._health_thread is not None and self._health_thread.is_alive():
+            self._health_thread.join(timeout=1.5)
+        self._health_thread = None
+        recorders = len(self._recorders)
         self.stop_recording()
         with self._lock:
             self.latest.clear()
+        self._injected.clear()
         for feed in self.feeds.values():
             feed.status = "NO_SIGNAL"
+            feed.message = "Stopped"
             feed.recording = False
+            feed.recording_path = None
+            feed.fps = 0.0
+            feed.frames_received = 0
+            feed.window_frames = 0
+            feed.dropped = 0
+            feed.frozen_s = 0.0
+            feed.black = False
+            feed.luma = None
+            feed.latency_estimate_ms = None
+            feed.latency_basis = "NOT_MEASURED"
+            feed.last_frame_mono = 0.0
+            feed.last_unique_mono = 0.0
+            feed.started_mono = 0.0
+            feed.no_frame_event = False
+        return {
+            "capture_processes": closed_processes,
+            "recorders_closed": recorders,
+            "threads_joined": joined,
+            "threads_expected": len(self.feeds),
+        }
 
     # ------------------------------------------------------------ simulation
     def _sim_loop(self, callsign: str) -> None:
@@ -210,7 +307,6 @@ class VideoManager:
             if fault == "loss":
                 feed.status = "NO_SIGNAL"
                 feed.message = "Injected signal loss"
-                feed.frames_received += 0
                 continue
             state = self.telemetry.vehicle(callsign)
             image = self._render_sim_frame(feed, state, now)
@@ -224,9 +320,14 @@ class VideoManager:
             if fault == "freeze" and callsign in self.latest:
                 frame_bytes = self.latest[callsign]
                 feed.frozen_s = (now - feed.last_unique_mono)
+                # Frames are still arriving, they are just the same frame: say LIVE until
+                # the freeze has actually lasted long enough to be a fault, then say so.
                 if feed.frozen_s > 2.0:
                     feed.status = "FROZEN"
                     feed.message = "Injected frozen frame"
+                else:
+                    feed.status = "RECORDING" if feed.recording else "LIVE"
+                    feed.message = "Synthetic optical feed"
             else:
                 frame_bytes = self._encode_jpeg(image, feed)
                 feed.last_unique_mono = now
@@ -235,11 +336,18 @@ class VideoManager:
             with self._lock:
                 self.latest[callsign] = frame_bytes
             feed.last_frame_mono = now
-            feed.frames_received += 1
             feed.fps = fps
             feed.luma = self._estimate_luma(image)
-            feed.latency_estimate_ms = 35.0
-            self._record_frame(callsign, image)
+            # A synthetic feed has no radio in it. Reporting a latency here would put a
+            # fabricated link number on the operator's screen, so the value is None and
+            # the reason is stated.
+            feed.latency_estimate_ms = None
+            feed.latency_basis = "SYNTHETIC_FEED_NO_LINK"
+            # The frame counters are written last: a reader that sees a non-zero count
+            # is guaranteed to see the honest metrics for that frame too.
+            feed.frames_received += 1
+            feed.window_frames += 1
+            self._record_frame(callsign, image, jpeg=frame_bytes)
 
     def _font(self, size: int, mono: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         key = (size, mono)
@@ -367,7 +475,7 @@ class VideoManager:
     @staticmethod
     def _estimate_luma(image: Image.Image) -> float:
         small = image.convert("L").resize((32, 18))
-        data = list(small.getdata())
+        data = small.tobytes()  # one byte per pixel in mode "L"
         return float(sum(data) / len(data))
 
     # ------------------------------------------------------------- real mode
@@ -418,6 +526,7 @@ class VideoManager:
                     now = time.monotonic()
                     feed.last_frame_mono = now
                     feed.frames_received += 1
+                    feed.window_frames += 1
                     frame_count += 1
                     unique = hash(jpeg) != feed.last_hash
                     if unique:
@@ -431,9 +540,10 @@ class VideoManager:
                             feed.black = (feed.luma or 0) < float(
                                 self.config.get("video", "black_luma_threshold", default=12)
                             )
-                            self._record_frame(callsign, image)
+                            self._record_frame(callsign, image, jpeg=jpeg)
                         except Exception:
-                            pass
+                            # A frame that will not decode is a lost frame, not a silent one.
+                            feed.dropped += 1
                     feed.status = "BLACK" if feed.black else ("RECORDING" if feed.recording else "LIVE")
                     feed.message = "Capture active" if not feed.black else "Black frame"
             process.wait(timeout=2)
@@ -448,6 +558,12 @@ class VideoManager:
     # --------------------------------------------------------------- health
     def _health_loop(self) -> None:
         freeze_timeout = float(self.config.get("video", "freeze_timeout_s", default=2.0))
+        # How long a pipeline that is supposed to be running may stay silent before the
+        # operator is told, in seconds, that nothing has ever arrived. The stall detector
+        # below needs a first frame to age against, so before this branch existed a
+        # capture process that produced zero frames sat at NO_SIGNAL "starting" forever
+        # and looked indistinguishable from one that had simply not been polled yet.
+        no_frame_timeout = float(self.config.get("video", "no_frame_timeout_s", default=8.0))
         last = time.monotonic()
         while not self._stop.is_set():
             time.sleep(0.5)
@@ -469,10 +585,33 @@ class VideoManager:
                         feed.frozen_s = 0.0
                         feed.message = "Feed recovered"
                         changed = True
-                    if feed.frames_received:
-                        measured = feed.frames_received / max(delta, 0.001)
+                    if feed.window_frames:
+                        measured = feed.window_frames / max(delta, 0.001)
                         feed.fps = measured if feed.fps == 0 else 0.7 * feed.fps + 0.3 * measured
-                        feed.frames_received = 0
+                        feed.window_frames = 0
+                elif feed.started_mono:
+                    wait = now - feed.started_mono
+                    if wait >= no_frame_timeout:
+                        detail = f"No frame {round(wait)} s after capture start"
+                        if feed.message != detail:
+                            # Each pass rewrites only the number; the status is already the
+                            # honest NO_SIGNAL, which is what preflight refuses to clear.
+                            feed.message = detail
+                            changed = True
+                        if not feed.no_frame_event:
+                            feed.no_frame_event = True
+                            changed = True
+                            self.bus.publish(
+                                "video.no_frame",
+                                {"callsign": feed.callsign, "feed_id": feed.feed_id,
+                                 "receiver": feed.receiver, "mode": self.mode,
+                                 "wait_s": round(wait, 1),
+                                 "detail": "Capture pipeline is running but has never "
+                                           "delivered a frame; the receiver may be "
+                                           "unlocked or the device mapping is wrong"},
+                                severity="warning", source="VIDEO",
+                                data_quality="SIMULATED" if self.mode == "SIMULATION" else "LIVE",
+                            )
                 if feed.recording and self._mission_id and not feed.recording_path:
                     feed.recording_path = str(self.evidence.path(self._mission_id, "video", f"{feed.callsign}.mp4"))
             if changed:
@@ -487,6 +626,9 @@ class VideoManager:
             "feeds": feeds,
             "live_count": live,
             "total": len(feeds),
+            # Started, silent, never-produced-a-frame. Reported separately so the console
+            # can say "2 live, 1 dead on arrival" instead of a single misleading count.
+            "waiting_count": sum(1 for feed in feeds if feed["no_frame_s"] is not None),
             "recording_count": sum(1 for feed in feeds if feed["recording"]),
             "policy": "Analog video is an operator aid, not a flight-control channel. Mapping is commissioned, not guessed.",
         }
@@ -514,71 +656,187 @@ class VideoManager:
 
     # ------------------------------------------------------------- recording
     def start_recording(self, mission_id: str) -> dict[str, Any]:
+        """Open one recorder per mapped feed, fed by the pipeline that is already running.
+
+        A DirectShow source can only be opened once per process pair: opening a second
+        `video=<device>` ffmpeg for recording steals the device from the live capture and
+        the operator loses the feed mid-sortie. REAL therefore encodes the MJPEG frames the
+        capture loop already produced instead of touching the device again.
+
+        A feed that has never delivered a frame is refused: an empty .mp4 in the evidence
+        folder reads as "video was captured" to whoever assembles the sortie report.
+        """
         self._mission_id = mission_id
         results = {}
         for callsign, feed in self.feeds.items():
+            blocker = self._recording_blocker(callsign, feed)
+            if blocker:
+                results[callsign] = {"recording": False, "error": blocker}
+                continue
             path = self.evidence.path(mission_id, "video", f"{callsign}.mp4")
             path.parent.mkdir(parents=True, exist_ok=True)
-            if self.mode == "SIMULATION" and cv2 is not None:
+            if self.mode == "SIMULATION":
+                if cv2 is None:
+                    results[callsign] = {"recording": False, "error": "OpenCV unavailable"}
+                    continue
                 writer = cv2.VideoWriter(
-                    str(path), cv2.VideoWriter_fourcc(*"mp4v"), 6.0, (FRAME_WIDTH, FRAME_HEIGHT)
+                    str(path), cv2.VideoWriter_fourcc(*"mp4v"),
+                    float(self.config.get("video", "sim_fps", default=6)),
+                    (FRAME_WIDTH, FRAME_HEIGHT),
                 )
-                if writer.isOpened():
-                    self._recorders[callsign] = writer
-                    feed.recording = True
-                    feed.recording_path = str(path)
-                    results[callsign] = {"recording": True, "path": str(path)}
-                    self.db.record_video_session(
-                        {"mission_id": mission_id, "feed_id": feed.feed_id, "callsign": callsign,
-                         "receiver": feed.receiver, "fingerprint": feed.device_fingerprint,
-                         "recording_path": str(path), "start_time": iso_now(),
-                         "health": feed.to_dict()}
-                    )
-                else:
+                if not writer.isOpened():
+                    writer.release()
                     results[callsign] = {"recording": False, "error": "VideoWriter unavailable"}
-            elif self.mode == "REAL" and feed.mapped and feed.device_fingerprint:
-                command = [
-                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                    "-f", "dshow", "-rtbufsize", "100M", "-i", f"video={feed.device_fingerprint}",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
-                    "-pix_fmt", "yuv420p", str(path),
-                ]
-                try:
-                    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    self._recorders[callsign] = process
-                    feed.recording = True
-                    feed.recording_path = str(path)
-                    results[callsign] = {"recording": True, "path": str(path), "pending_test": True}
-                except Exception as exc:
-                    results[callsign] = {"recording": False, "error": str(exc)}
+                    continue
+                self._recorders[callsign] = writer
+                self._finalise_recording_start(callsign, feed, mission_id, path,
+                                               {"recording": True, "path": str(path)}, results)
+            elif self.mode == "REAL":
+                recorder = self._open_pipe_recorder(path)
+                if isinstance(recorder, str):
+                    results[callsign] = {"recording": False, "error": recorder}
+                    continue
+                self._recorders[callsign] = recorder
+                self._finalise_recording_start(
+                    callsign, feed, mission_id, path,
+                    {"recording": True, "path": str(path), "pending_test": True,
+                     "recorded_from": "CAPTURE_STREAM",
+                     "note": "H.264 encode of the MJPEG frames the capture loop delivered; "
+                             "the analog link itself is not recorded."},
+                    results,
+                )
             else:
-                results[callsign] = {"recording": False, "error": "Feed not mapped"}
+                results[callsign] = {"recording": False, "error": f"Unknown mode {self.mode}"}
         self.bus.publish("video.recording", results, source="VIDEO",
                          data_quality="SIMULATED" if self.mode == "SIMULATION" else "LIVE")
         return results
 
-    def _record_frame(self, callsign: str, image: Image.Image) -> None:
+    def _recording_blocker(self, callsign: str, feed: VideoFeed) -> str | None:
+        """Why this feed cannot be recorded, in the order the operator needs to hear it.
+
+        The mapping and pipeline answers come first in REAL because they say what to fix;
+        the frame count is last because a running-but-silent pipeline is the case the
+        recorder used to accept and turn into an empty evidence file.
+        """
+        if self.mode == "REAL":
+            if not (feed.mapped and feed.device_fingerprint):
+                return "Feed not mapped"
+            thread = self._threads.get(callsign)
+            if thread is None or not thread.is_alive():
+                return "Capture pipeline is not running; nothing to record"
+        if feed.frames_received == 0:
+            return "Feed has never delivered a frame; there is nothing to record"
+        return None
+
+    def _open_pipe_recorder(self, path: Path) -> Any:
+        """ffmpeg stdin recorder; returns the process or an error string."""
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "image2pipe", "-vcodec", "mjpeg", "-framerate", str(self.REAL_RECORD_FPS),
+            "-i", "pipe:0", "-an", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26", str(path),
+        ]
+        try:
+            process = subprocess.Popen(command, stdin=subprocess.PIPE,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as exc:
+            return f"Recorder unavailable: {exc}"
+        return process
+
+    def _finalise_recording_start(self, callsign: str, feed: VideoFeed, mission_id: str,
+                                 path: Path, result: dict[str, Any],
+                                 results: dict[str, Any]) -> None:
+        feed.recording = True
+        feed.recording_path = str(path)
+        feed.status = "RECORDING"
+        results[callsign] = result
+        self._recorded_frames[callsign] = 0
+        self._session_rows[callsign] = self.db.record_video_session({
+            "mission_id": mission_id, "feed_id": feed.feed_id, "callsign": callsign,
+            "receiver": feed.receiver, "fingerprint": feed.device_fingerprint,
+            "recording_path": str(path), "mode": self.mode,
+            "start_time": iso_now(), "health": feed.to_dict(),
+        })
+
+    REAL_RECORD_FPS = 10.0  # matches the capture pipeline's -r 10
+
+    def _record_frame(self, callsign: str, image: Image.Image, jpeg: bytes | None = None) -> None:
+        """Hand one accepted frame to the open recorder, whichever kind it is."""
         writer = self._recorders.get(callsign)
-        if writer is None or cv2 is None or np is None:
+        if writer is None:
+            return
+        stdin = getattr(writer, "stdin", None)
+        if stdin is not None:  # REAL: the already-decoded MJPEG frame
+            payload = jpeg
+            if payload is None:
+                payload = self._encode_jpeg(image, self.feeds[callsign])
+            try:
+                stdin.write(payload)
+                self._recorded_frames[callsign] = self._recorded_frames.get(callsign, 0) + 1
+            except (BrokenPipeError, ValueError, OSError):
+                self._recorders.pop(callsign, None)
+            return
+        if cv2 is None or np is None:
             return
         try:
             frame = np.array(image.convert("RGB"))[:, :, ::-1]
             writer.write(frame)
+            self._recorded_frames[callsign] = self._recorded_frames.get(callsign, 0) + 1
         except Exception:
             pass
 
     def stop_recording(self) -> None:
-        for callsign, writer in list(self._recorders.items()):
-            try:
-                if hasattr(writer, "release"):
-                    writer.release()
-                elif hasattr(writer, "terminate"):
-                    writer.terminate()
-            except Exception:
-                pass
+        # A recorder whose pipe broke was dropped from _recorders by _record_frame, but its
+        # database row is still open. Iterating the union is what lets that row be closed
+        # with complete=False instead of being left as a start with no end.
+        for callsign in sorted(set(self._recorders) | set(self._session_rows)):
+            writer = self._recorders.get(callsign)
+            closed = True
+            if writer is None:
+                closed = False
+            else:
+                try:
+                    stdin = getattr(writer, "stdin", None)
+                    if stdin is not None:
+                        try:
+                            stdin.close()
+                        except Exception:
+                            pass
+                        try:
+                            code = writer.wait(timeout=5)
+                            closed = code == 0
+                        except subprocess.TimeoutExpired:
+                            writer.kill()
+                            closed = False
+                    elif hasattr(writer, "release"):
+                        writer.release()
+                    elif hasattr(writer, "terminate"):
+                        writer.terminate()
+                except Exception:
+                    closed = False
             feed = self.feeds.get(callsign)
+            session_row = self._session_rows.pop(callsign, 0)
+            frames_written = self._recorded_frames.pop(callsign, 0)
+            if session_row:
+                self.db.close_video_session(
+                    session_row, end_time=iso_now(), frames_recorded=frames_written,
+                    complete=closed and frames_written > 0,
+                    health={"frames_written": frames_written, "recorder_closed": closed,
+                            "mode": self.mode,
+                            "feed": feed.to_dict() if feed else None},
+                )
             if feed:
                 feed.recording = False
+                if feed.status == "RECORDING":
+                    feed.status = "LIVE"
+                if not closed and feed.recording_path:
+                    self.bus.publish(
+                        "video.recording_incomplete",
+                        {"callsign": callsign, "path": feed.recording_path,
+                         "detail": "Recorder exited non-zero; the file may be truncated"},
+                        severity="warning", source="VIDEO",
+                        data_quality="SIMULATED" if self.mode == "SIMULATION" else "LIVE",
+                    )
         self._recorders.clear()
 
     # --------------------------------------------------------------- access

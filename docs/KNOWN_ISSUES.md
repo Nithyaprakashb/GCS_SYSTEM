@@ -92,16 +92,20 @@ exists. Nothing here should be hidden in a demo.
    Host allow-list.
 2. **No cloud sync, remote viewing or multi-station collaboration.** All excluded
    by the offline-first requirement.
-3. **Map tiles are procedural, not survey imagery.** They convey geometry and
-   context offline; they are not cadastral or satellite maps. No internet tiles
-   are used at any zoom.
+3. **Map tiles are a local OpenStreetMap render, not survey imagery.** Inside the pack's
+   coverage box they are real streets, lakes, buildings and boundaries built offline by
+   `tools/offline_map.py` from a Geofabrik extract. Outside it — and whenever no pack is
+   installed — the surface is a deterministic procedural reference, which `GET /api/map/manifest`
+   reports as `kind: "procedural"`. Neither is cadastral or satellite imagery, and the station
+   says which one is on screen. No internet tiles are used at any zoom.
 4. **PDF reports are intentionally minimal.** The in-tree PDF writer produces
    text/tables without embedded video frames or map images.
 5. **No terrain awareness or obstacle database.** Separation checks use reported
    positions and configured minima, not terrain elevation.
-6. **Video latency measurement is approximate.** Health flags freeze, black,
-   loss and latency, but latency is derived from the local pipeline, not a
-   time-coded analogue signal.
+6. **Glass-to-glass video latency is not measured.** Feed health reports freeze, black,
+   loss and pipeline-side timings it actually owns; the reported `latency_basis` is
+   `NOT_MEASURED` because nothing time-codes the analog picture at the transmitter. Any
+   end-to-end figure would be invented. Bench work item, `PENDING TEST`.
 7. **Single-instance lock.** A second Electron launch focuses the first window;
    it does not open a second station.
 8. **Port conflict handling is manual.** If 8765 is occupied by an unrelated
@@ -111,6 +115,34 @@ exists. Nothing here should be hidden in a demo.
    `TIMEOUT`. This is safer than blind retries for release, but it means a
    transient serial drop requires operator re-action or the mission state
    machine's next transition.
+10. **The station never transmits a MAVLink `HEARTBEAT`.** It parses inbound
+    heartbeats and answers the fleet's requests, but a ground-station component is
+    invisible to the autopilot. Consequence: ArduPilot's GCS comm-loss failsafe
+    (`FS_GCS_ENABLE`) must stay at 0, and is documented as `DESIGNED, NOT PROVISIONED`
+    rather than enabled. A heartbeat sender lands *before* that parameter is ever touched,
+    because enabling it first would make link loss more dangerous, not less.
+    Requirement `FR-016`; findings `A-2` / `H-6`; fix row `27a`.
+11. **The readiness gate is the GCS's own, not the autopilot's.** `ARMING_CHECK` is never
+    queried and the FC's pre-arm failure list is never read, so `READY` means "every check
+    this station can perform passes". The aircraft will still refuse to arm on its own
+    grounds; the operator just isn't told which ones. Requirement `FR-032`; fix row `32b`.
+12. **Pre-arm and EKF `STATUSTEXT` is captured but not surfaced per aircraft.** The raw
+    ArduPilot string is stored and published with its original severity, and appears in the
+    event log; there is no plain-language explanation and no field on the vehicle card.
+    Requirement `FR-014`; fix row `42`.
+13. **No radio link diagnostics beyond `RADIO_STATUS` RSSI.** Packet loss, rx-available
+    rate and round-trip latency are not computed anywhere. They are reported as
+    unavailable, never estimated. Requirement `FR-015`; fix row `44`.
+14. **No telemetry trend detection.** Battery and EKF protections compare a value to a
+    limit; nothing watches the *direction* of a series, so a slow drain or a creeping
+    variance is not an alert until it crosses. Requirement `FR-093`; fix row `45`.
+15. **The video HUD exists only on the synthetic feed, and is not timestamp-matched.**
+    Real analog frames pass through un-overlaid; the overlay would have to claim a
+    telemetry-to-frame match the station cannot measure. Requirement `FR-073`; fix row `43`,
+    gated on item 6.
+16. **UI refresh is event-driven with a 1.4 s polling floor, not the 5 Hz in the design
+    target**, and no crash/power-interruption or 2560×1440 layout test has been run.
+    Requirements `NFR-004` / `NFR-008` / `NFR-002`; fix rows `46` and `47`.
 
 ---
 

@@ -15,18 +15,24 @@ from .telemetry import TelemetryManager, MAV_CMD_DO_SET_SERVO
 from .util import iso_now
 
 STATES = [
-    "QUEUED", "LAUNCHING", "TRANSIT", "HOLD_CLEARANCE", "DESCENT",
-    "HOVER_VERIFY", "RELEASE_SENT", "CONFIRMED", "UNKNOWN", "CLIMB", "RETURNING",
-    "LANDING", "STANDBY", "ABORTED",
+    "QUEUED", "LAUNCHING", "HOLD_CLEARANCE", "TRANSIT", "DESCENT",
+    "HOVER_VERIFY", "ACK_PENDING", "RELEASE_SENT", "CONFIRMED", "UNKNOWN",
+    "CLIMB", "RETURNING", "LANDING", "STANDBY", "ABORTED",
 ]
 
+# The release path is deliberately narrow: a servo command may only leave the
+# GCS once the machine has reached HOVER_VERIFY, and the kit is only marked as
+# away until the aircraft has ACKed that specific command.
 ALLOWED: dict[str, set[str]] = {
-    "QUEUED": {"LAUNCHING", "TRANSIT", "ABORTED"},
-    "LAUNCHING": {"TRANSIT", "ABORTED", "RETURNING"},
-    "TRANSIT": {"HOLD_CLEARANCE", "DESCENT", "ABORTED", "RETURNING"},
-    "HOLD_CLEARANCE": {"DESCENT", "ABORTED", "RETURNING"},
+    "QUEUED": {"LAUNCHING", "ABORTED"},
+    "LAUNCHING": {"HOLD_CLEARANCE", "TRANSIT", "ABORTED", "RETURNING"},
+    "HOLD_CLEARANCE": {"TRANSIT", "ABORTED", "RETURNING"},
+    "TRANSIT": {"DESCENT", "ABORTED", "RETURNING"},
     "DESCENT": {"HOVER_VERIFY", "ABORTED", "RETURNING"},
-    "HOVER_VERIFY": {"RELEASE_SENT", "ABORTED", "RETURNING"},
+    "HOVER_VERIFY": {"ACK_PENDING", "ABORTED", "RETURNING"},
+    # An aborted sortie can strand a release command mid-flight; that kit has left
+    # the magazine with no evidence, so UNKNOWN is its honest terminal state.
+    "ACK_PENDING": {"RELEASE_SENT", "UNKNOWN", "ABORTED", "RETURNING"},
     "RELEASE_SENT": {"CONFIRMED", "UNKNOWN"},
     "CONFIRMED": {"CLIMB"},
     "UNKNOWN": {"CLIMB"},
@@ -37,6 +43,9 @@ ALLOWED: dict[str, set[str]] = {
     "ABORTED": {"RETURNING", "STANDBY"},
 }
 
+# States in which a release command may be issued. Nothing else may fire a servo.
+RELEASE_ELIGIBLE = {"HOVER_VERIFY"}
+
 # Operator-facing assignment lifecycle. Delivery state names are internal
 # machine states (CLIMB, STANDBY, …) and must not leak into the allocation
 # badge; once a payload is CONFIRMED the assignment stays DELIVERED even
@@ -44,10 +53,11 @@ ALLOWED: dict[str, set[str]] = {
 ASSIGNMENT_STATUS = {
     "QUEUED": "ASSIGNED",
     "LAUNCHING": "IN_DELIVERY",
-    "TRANSIT": "IN_DELIVERY",
     "HOLD_CLEARANCE": "IN_DELIVERY",
+    "TRANSIT": "IN_DELIVERY",
     "DESCENT": "IN_DELIVERY",
     "HOVER_VERIFY": "IN_DELIVERY",
+    "ACK_PENDING": "IN_DELIVERY",
     "RELEASE_SENT": "IN_DELIVERY",
     "CONFIRMED": "DELIVERED",
     "UNKNOWN": "UNKNOWN",
@@ -57,10 +67,11 @@ ASSIGNMENT_STATUS = {
 SURVIVOR_STATUS = {
     "QUEUED": "ASSIGNED",
     "LAUNCHING": "IN_DELIVERY",
-    "TRANSIT": "IN_DELIVERY",
     "HOLD_CLEARANCE": "IN_DELIVERY",
+    "TRANSIT": "IN_DELIVERY",
     "DESCENT": "IN_DELIVERY",
     "HOVER_VERIFY": "IN_DELIVERY",
+    "ACK_PENDING": "IN_DELIVERY",
     "RELEASE_SENT": "IN_DELIVERY",
     "CONFIRMED": "DELIVERED",
     "UNKNOWN": "UNKNOWN",
@@ -108,6 +119,7 @@ class DeliveryEngine:
             "created_at": iso_now(),
             "updated_at": iso_now(),
             "release_tx_id": None,
+            "pending_tx_id": None,
             "beam_result": None,
             "clearance": None,
             "history": [{"state": "QUEUED", "at": iso_now(), "detail": "Assignment created"}],
@@ -197,10 +209,30 @@ class DeliveryEngine:
         assignment_id: str,
         *,
         hover_verified: bool,
-        servo_channel: int = 9,
-        release_pwm: int = 1900,
+        servo_channel: int | None = None,
+        release_pwm: int | None = None,
     ) -> dict[str, Any]:
+        """Command a kit release. The servo frame only leaves after every gate below.
+
+        Ordering matters: the delivery machine must already be in a release-
+        eligible state, safety clearance must pass, the kit must be reserved for
+        this survivor, and only then is the command sent. The kit is not marked
+        away until the aircraft has ACKed that exact command.
+        """
         task = self.tasks[assignment_id]
+        if task["state"] not in RELEASE_ELIGIBLE:
+            self.bus.publish(
+                "payload.denied",
+                {"assignment_id": assignment_id, "reasons": [f"Task is {task['state']}, not release-eligible"]},
+                severity="critical",
+                source="DELIVERY",
+                data_quality="SIMULATED" if self.bus.mission_mode == "SIMULATION" else "LIVE",
+            )
+            return {
+                "sent": False,
+                "reason": f"Release refused: task is {task['state']}, must be one of "
+                          + "/".join(sorted(RELEASE_ELIGIBLE)),
+            }
         survivor = self.survivors.get(task["survivor_id"])
         if not survivor:
             return {"sent": False, "reason": "Survivor missing"}
@@ -229,21 +261,113 @@ class DeliveryEngine:
         if not kit_ok:
             return {"sent": False, "reason": kit_reason, "clearance": clearance}
 
-        tx = self.telemetry.send_command(
-            task["callsign"],
-            MAV_CMD_DO_SET_SERVO,
-            [float(servo_channel), float(release_pwm), 0, 0, 0, 0, 0],
-            f"Release {task['kit_id']} for {task['survivor_id']}",
+        # Per-aircraft servo wiring comes from the fleet profile; a shared
+        # hard-coded channel would fire the wrong latch on the other magazine.
+        channel = servo_channel if servo_channel is not None else int(
+            self.config.vehicle(task["callsign"]).get("release_servo_channel", 9)
         )
-        self.ledger.mark_release_sent(task["kit_id"], tx.tx_id)
-        self.transition(assignment_id, "RELEASE_SENT", detail=f"Release command {tx.tx_id}",
-                        release_tx_id=tx.tx_id)
-        return {"sent": True, "transaction": tx.to_dict(), "clearance": clearance}
+        pwm = release_pwm if release_pwm is not None else int(
+            self.config.vehicle(task["callsign"]).get("release_pwm", 1900)
+        )
+
+        # The machine moves to ACK_PENDING *before* the frame is emitted, so a
+        # concurrent release on the same task is blocked by the state table.
+        self.transition(assignment_id, "ACK_PENDING", detail=f"Release command queued for {task['kit_id']}")
+        try:
+            tx = self.telemetry.send_command(
+                task["callsign"],
+                MAV_CMD_DO_SET_SERVO,
+                [float(channel), float(pwm), 0, 0, 0, 0, 0],
+                f"Release {task['kit_id']} for {task['survivor_id']}",
+            )
+        except Exception as exc:
+            # The command never left the GCS. The kit is UNKNOWN (no evidence), never
+            # silently re-queued and never reported as delivered.
+            self.ledger.note_command_abandoned(task["kit_id"], reason=f"Release command failed: {exc}")
+            self.transition(assignment_id, "UNKNOWN",
+                            detail=f"Release command error: {exc}", beam_result="NO_EVIDENCE")
+            return {"sent": False, "settled": True, "state": "UNKNOWN", "reason": str(exc)}
+        with self._lock:
+            self.tasks[assignment_id]["pending_tx_id"] = tx.tx_id
+        result = self.settle_release_transaction(tx.tx_id)
+        return {"transaction": tx.to_dict(), "clearance": clearance, **result}
+
+    def settle_release_transaction(self, tx_id: str) -> dict[str, Any]:
+        """Advance a task on the ACK of its own release command.
+
+        ACKNOWLEDGED -> RELEASE_SENT and the kit is marked away.
+        REJECTED / TIMEOUT -> the command is abandoned, the kit is UNKNOWN and is
+        never re-sent automatically. SENT (no ACK yet) leaves the task in
+        ACK_PENDING so a late ACK can still settle it.
+        """
+        with self._lock:
+            tx = self.telemetry.transaction(tx_id)
+            if not tx:
+                return {"settled": False, "reason": "Release transaction not found"}
+            assignment_id = next(
+                (aid for aid, task in self.tasks.items() if task.get("pending_tx_id") == tx_id),
+                None,
+            )
+            if assignment_id is None:
+                return {"settled": False, "reason": "No task is awaiting this release transaction"}
+            task = self.tasks[assignment_id]
+            # The ACK may already have arrived on the reader thread before the caller
+            # polled. Settling twice must be a no-op, never a second ledger write.
+            if task["state"] != "ACK_PENDING":
+                delivered = task["state"] in {"RELEASE_SENT", "CONFIRMED", "CLIMB", "RETURNING", "STANDBY"}
+                return {"sent": delivered, "settled": True, "state": task["state"],
+                        "already_settled": True}
+            state = tx["state"]
+            if state == "SENT":
+                return {"settled": False, "reason": "Awaiting COMMAND_ACK", "state": "ACK_PENDING"}
+            if state in {"ACKNOWLEDGED", "VERIFIED"}:
+                self.ledger.mark_release_sent(task["kit_id"], tx_id)
+                self.transition(assignment_id, "RELEASE_SENT",
+                                detail=f"Release acknowledged ({tx_id})", release_tx_id=tx_id)
+                return {"sent": True, "settled": True, "state": "RELEASE_SENT"}
+            # Anything else (REJECTED / TIMEOUT / NOT_ADDRESSED / ACK_UNVERIFIED): the command
+            # never completed. Distinguish "the kit is still aboard" from "the kit is gone".
+            if tx.get("transmitted"):
+                # A frame was written to the link and its outcome is unproven. The latch may
+                # have fired, so the kit cannot be counted back into the magazine: it becomes
+                # UNKNOWN and is never re-fired, and one physical kit is never promised to two
+                # survivors.
+                self.ledger.note_command_abandoned(
+                    task["kit_id"], reason=f"Release command {state}: {tx.get('detail', '')}")
+                self.transition(assignment_id, "UNKNOWN",
+                                detail=f"Release command {state}: frame transmitted, result unproven",
+                                beam_result="NO_EVIDENCE")
+                return {"sent": False, "settled": True, "state": "UNKNOWN",
+                        "kit_transmitted_unproven": True, "reason": tx.get("detail", state)}
+            kit_now = self.ledger.kits.get(task["kit_id"])
+            status = (kit_now or {}).get("load_status")
+            if status == "RESERVED":
+                # The servo frame was never accepted, so the kit is physically still in
+                # the magazine. Put it back and mark this attempt aborted: the survivor is
+                # unserved and can be re-queued. This is not a lost kit.
+                self.ledger.cancel_reservation(task["kit_id"],
+                                               reason=f"Release command {state}: {tx.get('detail', '')}")
+                self.transition(assignment_id, "ABORTED",
+                                detail=f"Release command {state}; kit returned to the magazine")
+                return {"sent": False, "settled": True, "state": "ABORTED",
+                        "kit_back_in_magazine": True, "reason": tx.get("detail", state)}
+            if status == "RELEASE_SENT":
+                # A command was acknowledged and then the evidence never arrived: the kit's
+                # fate is unknown and it is never re-fired automatically.
+                self.ledger.note_command_abandoned(task["kit_id"], reason=f"Release command {state}")
+            self.transition(assignment_id, "UNKNOWN",
+                            detail=f"Release command {state}: {tx.get('detail', '')}",
+                            beam_result="NO_EVIDENCE")
+            return {"sent": False, "settled": True, "state": "UNKNOWN", "reason": tx.get("detail", state)}
 
     def apply_beam_result(self, assignment_id: str, beam_result: str, *, event_id: str | None = None) -> dict[str, Any]:
         task = self.tasks[assignment_id]
         if task["state"] != "RELEASE_SENT":
             return {"accepted": False, "reason": f"Task is {task['state']}, not RELEASE_SENT"}
+        if task.get("release_tx_id") is None:
+            return {"accepted": False, "reason": "No release command id on this task"}
+        # The ledger is the single writer of payload evidence; it enforces the
+        # RELEASE_SENT precondition and one-record-per-event-id idempotency.
         kit = self.ledger.apply_beam_result(task["kit_id"], beam_result, event_id=event_id)
         confirmed = kit["final_status"] == "DELIVERED"
         self.transition(
@@ -251,20 +375,6 @@ class DeliveryEngine:
             "CONFIRMED" if confirmed else "UNKNOWN",
             detail=f"Break-beam result: {beam_result}",
             beam_result=beam_result,
-        )
-        self.db.record_payload_event(
-            {
-                "mission_id": self.bus.mission_id,
-                "event_id": event_id,
-                "kit_id": task["kit_id"],
-                "survivor_id": task["survivor_id"],
-                "callsign": task["callsign"],
-                "command": "RELEASE",
-                "beam_result": beam_result,
-                "result": kit["final_status"],
-                "timestamp": iso_now(),
-                "raw": {"assignment_id": assignment_id},
-            }
         )
         return {"accepted": True, "confirmed": confirmed, "kit": kit}
 

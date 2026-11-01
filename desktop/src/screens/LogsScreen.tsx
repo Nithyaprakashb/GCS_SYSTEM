@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { Download, Filter, RefreshCw, ScrollText, Search } from "lucide-react";
 import { useGcs } from "../state/GcsContext";
 import { Badge, Empty, Panel } from "../components/ui";
-import { fmtClock, statusTone } from "../lib/format";
+import { fmtClock, qualityTone, statusTone } from "../lib/format";
 import type { GcsEvent } from "../lib/types";
 
 const SEVERITIES = ["all", "critical", "error", "warning", "info", "debug"];
@@ -227,7 +227,7 @@ export function LogsScreen() {
                       </Badge>
                     </td>
                     <td className="mono" style={{ fontSize: 10 }}>{event.source}</td>
-                    <td className="mono" style={{ fontSize: 9.5, color: event.data_quality === "SIMULATED" ? "var(--info)" : "var(--muted)" }}>
+                    <td className="mono" style={{ fontSize: 9.5, color: `var(--${qualityTone(event.data_quality)})` }}>
                       {event.data_quality}
                     </td>
                     <td style={{ lineHeight: 1.45 }}>{summarise(event)}</td>

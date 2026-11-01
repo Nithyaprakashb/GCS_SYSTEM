@@ -76,6 +76,16 @@ The frontend treats this snapshot as read-only truth. It never derives a
 | GET | `/api/system/config` | effective configuration with secrets redacted (there are none) |
 | PATCH | `/api/system/config` | validated patch; broadcasts `CONFIG_UPDATE` |
 | POST | `/api/system/mode` | `{"mode": "SIMULATION"}` or `{"mode": "REAL"}` |
+| POST | `/api/system/shutdown` | Close the station's own services; requires `{"confirmation": "SHUTDOWN"}`, a non-empty `X-Operator` header and an optional `reason` |
+
+`POST /api/system/shutdown` is what the Electron shell calls before it exits, because on
+Windows `child.kill()` is `TerminateProcess` — it skips Python teardown, leaves `ffmpeg`
+grandchildren holding the capture device, and leaves the event queue unwritten. Guards: the
+typed token, the operator header (a cross-origin form POST cannot set one without a CORS
+preflight this server refuses), and a `409` while `mission.phase == "EXECUTING"` — the station
+must not close with aircraft airborne. It closes only what it owns: **no endpoint stops an
+onboard autopilot protection, and shutdown never sends a flight command.** The shell escalates
+to a process-tree kill if this call never returns. Tested in `tests/test_station_shutdown.py`.
 
 `PATCH /api/system/config` body:
 
@@ -201,11 +211,53 @@ beam yields `UNKNOWN` and never triggers an automatic retry.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/map/style` | MapLibre style JSON using local raster tiles only |
-| GET | `/api/map/tiles/{z}/{x}/{y}.png?theme=dark\|light` | procedurally rendered offline tile |
+| GET | `/api/map/style` | MapLibre style JSON using local raster tiles only; the raster source's `maxzoom` is set from the tile-pack manifest |
+| GET | `/api/map/manifest` | Basemap provenance: which surface is on screen, and where its data came from |
+| GET | `/api/map/tiles/{z}/{x}/{y}.png?theme=dark\|light` | Local raster tile — from the OSM pack, an over-zoomed parent of one, or the procedural fallback |
 
 The style contains no glyph URL, no sprite URL and no external source. There are
 no internet map tiles at any zoom. Themes are cached separately.
+
+Lookup order for a tile: an exact cached tile, then the covered parent from the pack
+(`x >> shift`, `y >> shift` at the pack's top zoom), then the procedural renderer — whose
+output is written to disk and stamped as invented. The over-zoom step is the reason the
+style's `maxzoom` stops at the pack top: a z17 request must return a magnified **real** tile,
+not a tile the server had to imagine. Verified against the running station on 2026-11-01
+(`z17 → 14 997 B` from the OSM parent; an uncovered tile → `46 311 B` procedural).
+
+`GET /api/map/manifest` returns one of two shapes. With a pack installed — this is the real
+answer from this station on 2026-11-01, abridged only where marked:
+
+```json
+{"kind": "openstreetmap-offline-pack",
+ "label": "OpenStreetMap offline tile pack",
+ "attribution": [
+   "OpenStreetMap © OpenStreetMap contributors · ODbL · data as of 2026-10-30T21:24:51Z",
+   "Offline tile pack (building, commercial, …, wood) · built 2026-11-01T10:16:03Z · outside the covered area the surface falls back to procedural reference"],
+ "network_access": false,
+ "pack_zooms": [10, 11, 12, 13, 14, 15, 16],
+ "coverage_deg": [77.4, 12.75, 77.9, 13.25],
+ "osm_data_date": "2026-10-30T21:24:51Z",
+ "built_at": "2026-11-01T10:16:03Z",
+ "layers": {"building": 251679, "road_minor": 166616, "road_major": 5961,
+            "road_medium": 4167, "water": 13739, "residential": 10078, "…": "14 layers in all"},
+ "simplifications": [
+   "polygon interior rings (lake islands, courtyards) are filled, not punched",
+   "no street or place labels",
+   "geometry culled by bounding box, not clipped to tile edges"],
+ "note": "Tiles inside the recorded boxes are rendered from OpenStreetMap data. Anywhere else the surface is the procedural reference."}
+```
+
+Without one — and also when the manifest is missing or unparseable, which is the deliberate
+safe side — the same endpoint answers `kind: "procedural"`, `label: "Procedural reference
+surface"`, empty `pack_zooms`, `coverage_deg: null`, `osm_data_date: null` and a note telling the
+operator to run `tools/offline_map.py extract` and `build`. `network_access` is `false` in both
+shapes; nothing in this service opens a socket for a tile.
+
+`coverage_deg`, `layers` and `simplifications` come from the pack manifest, so a rebuilt pack
+changes what the station claims about it. The manifest is re-read when the file's size or mtime
+changes, so no restart is needed. `attribution` is what the style shows. Tested in
+`tests/test_offline_map.py` (25 tests), including the corrupt-manifest and mtime cases.
 
 ---
 

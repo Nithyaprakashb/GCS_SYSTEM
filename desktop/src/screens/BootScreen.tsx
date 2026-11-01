@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ArrowRight, Check, Loader2, ShieldCheck, X } from "lucide-react";
+import { ArrowRight, Check, Loader2, ShieldCheck, TriangleAlert, X } from "lucide-react";
 import { api } from "../lib/api";
 import { Logo } from "../components/ui";
 
@@ -62,7 +62,7 @@ export function BootScreen({ onEnter }: { onEnter: () => void }) {
               };
             }
           }
-          return { ...check, state: "ok" as CheckState, detail: check.detail };
+          return { ...check, state: "warn" as CheckState, detail: "Not reported by this backend build" };
         });
         setChecks(mapped);
         const failed = mapped.some((check) => check.state === "fail");
@@ -88,6 +88,8 @@ export function BootScreen({ onEnter }: { onEnter: () => void }) {
       window.clearInterval(timer);
     };
   }, []);
+
+  const backendFailed = checks.some((check) => check.id === "backend" && check.state === "fail");
 
   return (
     <div className="splash">
@@ -128,10 +130,12 @@ export function BootScreen({ onEnter }: { onEnter: () => void }) {
             <div className="splash-check" key={check.id}>
               {check.state === "pending" && <Loader2 size={13} className="spin" style={{ animation: "spin .9s linear infinite" }} />}
               {check.state === "ok" && <Check size={13} style={{ color: "var(--ok)" }} />}
-              {check.state === "warn" && <Check size={13} style={{ color: "var(--warn)" }} />}
+              {/* A tick in amber still reads as "passed". warn and unverified need a
+                  different glyph, not just a different colour. */}
+              {check.state === "warn" && <TriangleAlert size={13} style={{ color: "var(--warn)" }} />}
               {check.state === "fail" && <X size={13} style={{ color: "var(--danger)" }} />}
               <span style={{ color: check.state === "fail" ? "var(--danger)" : undefined }}>{check.label}</span>
-              <span className={`state ${check.state === "ok" ? "ok" : ""}`} style={{ maxWidth: 210, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={check.detail}>
+              <span className={`state ${check.state === "ok" ? "ok" : check.state === "warn" ? "warn" : ""}`} style={{ maxWidth: 210, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={check.detail}>
                 {check.state === "pending" ? "checking" : check.state === "fail" ? "failed" : check.detail}
               </span>
             </div>
@@ -141,8 +145,10 @@ export function BootScreen({ onEnter }: { onEnter: () => void }) {
           <div className="notice danger" style={{ background: "rgba(239,95,99,.09)", color: "#ef8f92" }}>
             <X size={14} />
             <div>
-              <strong>Ground service unreachable.</strong> {fatal}. Start the backend with
-              <span className="mono"> python -m rescueswarm.main</span> and retry.
+              <strong>{backendFailed ? "Ground service unreachable." : "Startup check failed."}</strong> {fatal}.
+              {backendFailed
+                ? <> Start it with <span className="mono">python -m rescueswarm.main</span> — this screen re-checks every 4 s on its own.</>
+                : " The station will not authorise launch until this clears."}
             </div>
           </div>
         )}

@@ -134,6 +134,12 @@ CREATE TABLE IF NOT EXISTS payload_events (
   timestamp TEXT, raw_json TEXT
 );
 
+-- One break-beam report is one piece of evidence. A replayed or duplicated
+-- report with the same id is rejected at the storage layer as well as in the
+-- ledger, so it can never advance a second kit.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_payload_events_evidence
+  ON payload_events(mission_id, event_id) WHERE event_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS safety_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   mission_id TEXT, event_id TEXT, severity TEXT, rule_id TEXT,
@@ -143,7 +149,8 @@ CREATE TABLE IF NOT EXISTS safety_events (
 CREATE TABLE IF NOT EXISTS video_sessions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   mission_id TEXT, feed_id TEXT, callsign TEXT, receiver TEXT,
-  fingerprint TEXT, recording_path TEXT, start_time TEXT, end_time TEXT,
+  fingerprint TEXT, recording_path TEXT, mode TEXT, start_time TEXT, end_time TEXT,
+  frames_recorded INTEGER, complete INTEGER,
   health_json TEXT
 );
 
@@ -215,6 +222,34 @@ class Database:
         }
         if "mission_id" not in observation_columns:
             self._conn.execute("ALTER TABLE survivor_observations ADD COLUMN mission_id TEXT")
+        # Recording close-out for databases created before the video session was a
+        # two-ended record. Older rows keep their start data and simply stay unfinished.
+        video_columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(video_sessions)").fetchall()
+        }
+        for column, sql_type in (("mode", "TEXT"), ("frames_recorded", "INTEGER"),
+                                 ("complete", "INTEGER")):
+            if column not in video_columns:
+                self._conn.execute(f"ALTER TABLE video_sessions ADD COLUMN {column} {sql_type}")
+        # Evidence idempotency for databases created before the constraint
+        # existed. An older store that already holds two reports with the same
+        # id keeps working; the ledger still de-duplicates in memory.
+        try:
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_payload_events_evidence "
+                "ON payload_events(mission_id, event_id) WHERE event_id IS NOT NULL"
+            )
+        except sqlite3.IntegrityError:
+            pass
+
+    def get_payload_events(self, mission_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT mission_id, event_id, kit_id, survivor_id, callsign, command, "
+                "beam_result, result, timestamp FROM payload_events WHERE mission_id = ?",
+                (mission_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     # ------------------------------------------------------------------ basics
     def execute(self, sql: str, params: tuple | dict = ()) -> sqlite3.Cursor:
@@ -599,12 +634,12 @@ class Database:
             ),
         )
 
-    def record_video_session(self, session: dict[str, Any]) -> None:
-        self.execute(
+    def record_video_session(self, session: dict[str, Any]) -> int:
+        cursor = self.execute(
             """INSERT INTO video_sessions
                (mission_id, feed_id, callsign, receiver, fingerprint, recording_path,
-                start_time, end_time, health_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                mode, start_time, end_time, health_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session.get("mission_id"),
                 session.get("feed_id"),
@@ -612,10 +647,30 @@ class Database:
                 session.get("receiver"),
                 session.get("fingerprint"),
                 session.get("recording_path"),
+                session.get("mode"),
                 session.get("start_time"),
                 session.get("end_time"),
                 json.dumps(json_safe(session.get("health", {})), separators=(",", ":")),
             ),
+        )
+        return int(cursor.lastrowid or 0)
+
+    def close_video_session(self, session_id: int, *, end_time: str,
+                            frames_recorded: int | None, complete: bool,
+                            health: dict[str, Any]) -> None:
+        """Stamp the closing evidence on the row that opened the recording.
+
+        Without this the table only ever holds starts, and a sortie report cannot say
+        whether a recording finished or the process died mid-flight.
+        """
+        if not session_id:
+            return
+        self.execute(
+            """UPDATE video_sessions
+               SET end_time = ?, frames_recorded = ?, complete = ?, health_json = ?
+               WHERE id = ?""",
+            (end_time, frames_recorded, 1 if complete else 0,
+             json.dumps(json_safe(health), separators=(",", ":")), session_id),
         )
 
     # ------------------------------------------------------------------- replay

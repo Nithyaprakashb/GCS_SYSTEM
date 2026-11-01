@@ -23,6 +23,13 @@ desktop/release/
 data/
 logs/
 
+# --- Offline basemap inputs and output ---
+# The regional .osm.pbf (~1.6 GB), the pyrosm parquet cache and the rendered
+# basemap geometry. All of it is reproducible with
+# `python tools/offline_map.py extract && python tools/offline_map.py build`,
+# and none of it belongs in a source repository or in a station's git clone.
+map/
+
 # --- Secrets ---
 .env
 .env.*

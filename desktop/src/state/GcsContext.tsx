@@ -30,6 +30,7 @@ interface GcsContextValue {
   setTheme: (theme: Theme) => void;
   refresh: () => Promise<void>;
   run: <T>(label: string, action: () => Promise<T>, success?: string) => Promise<T | null>;
+  notify: (kind: Toast["kind"], title: string, detail?: string) => void;
   busy: string | null;
   toasts: Toast[];
   dismissToast: (id: number) => void;
@@ -169,11 +170,12 @@ export function GcsProvider({ children }: { children: ReactNode }) {
       setTheme,
       refresh,
       run,
+      notify,
       busy,
       toasts,
       dismissToast,
     }),
-    [state, events, connected, loading, error, theme, setTheme, refresh, run, busy, toasts, dismissToast],
+    [state, events, connected, loading, error, theme, setTheme, refresh, run, notify, busy, toasts, dismissToast],
   );
 
   return <GcsContext.Provider value={value}>{children}</GcsContext.Provider>;

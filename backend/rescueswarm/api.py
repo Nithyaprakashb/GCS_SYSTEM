@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import threading
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .config import APP_VERSION, SAMPLES_DIR
+from .config import APP_VERSION, SAMPLES_DIR, ConfigError, safety_keys, validate_patch
 from .mission_engine import MissionError
 from .mavlink import TransportError
 
@@ -87,6 +89,21 @@ class AskBody(BaseModel):
     question: str
 
 
+class ShutdownBody(BaseModel):
+    confirmation: str = ""
+    reason: str = "Station stopped"
+
+
+def _schedule_exit(delay_s: float = 0.5) -> None:
+    """End the process once the shutdown response has been flushed.
+
+    A separate seam so the shutdown contract is testable without ending a test run:
+    os._exit is deliberate here because the service teardown above has already closed
+    the capture children, drained the event writer and closed the database.
+    """
+    threading.Timer(delay_s, lambda: os._exit(0)).start()
+
+
 # ---------------------------------------------------------------------- health
 @router.get("/health")
 async def health(request: Request) -> dict[str, Any]:
@@ -132,16 +149,39 @@ async def system_config(request: Request) -> dict[str, Any]:
 
 @router.patch("/system/config")
 async def update_config(request: Request, body: ConfigBody) -> dict[str, Any]:
+    """Apply a validated settings patch.
+
+    Unknown keys, out-of-range values and protected commissioning records are
+    refused. Safety-critical thresholds cannot be amended while a sortie is
+    READY or EXECUTING, so a configuration call is never a force-start or
+    force-release path.
+    """
     state = get_state(request)
     try:
-        updated = state.config.update(body.patch)
-    except (ValueError, TypeError) as exc:
+        clean = validate_patch(body.patch, state.config.data)
+    except ConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    gated = safety_keys(clean)
+    if gated and state.mission.phase in {"READY", "EXECUTING"}:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Safety-critical settings cannot change while a mission is ready or executing: "
+                + ", ".join(gated) + ". Abort or finish the sortie, amend, then re-run preflight."
+            ),
+        )
+    try:
+        updated = state.config.update(clean)
+    except ConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     state.bus.publish("operator.action",
-                      {"action": "CONFIG_UPDATE", "sections": sorted(body.patch.keys()),
-                       "operator": operator(request)},
+                      {"action": "CONFIG_UPDATE", "sections": sorted(clean.keys()),
+                       "safety_critical_keys": gated, "operator": operator(request)},
                       source="OPERATOR", data_quality="SYSTEM")
-    return {"updated": updated, "note": "Restart telemetry/video services to apply transport changes."}
+    note = "Restart telemetry/video services to apply transport changes."
+    if gated:
+        note += " Safety-critical settings changed — re-run preflight before the next launch."
+    return {"updated": updated, "note": note, "safety_critical_keys": gated}
 
 
 @router.post("/system/mode")
@@ -151,6 +191,52 @@ async def set_mode(request: Request, body: ModeBody) -> dict[str, Any]:
         return await state.set_mode(body.mode, operator(request))
     except Exception as exc:
         raise http_error(exc) from exc
+
+
+@router.post("/system/shutdown")
+async def system_shutdown(request: Request, body: ShutdownBody) -> dict[str, Any]:
+    """Stop every child service, then let the process leave on its own terms.
+
+    On Windows a parent cannot SIGTERM a child: the shell's kill() is TerminateProcess,
+    which skips this handler and leaves ffmpeg holding the capture device and the event
+    queue unwritten. The station therefore asks over loopback, drains what it owns, and
+    only then exits. The shell escalates to a tree kill if this call never finishes.
+
+    Guards: a typed confirmation, an explicit operator header (a cross-origin form POST
+    cannot set one without a CORS preflight this server refuses), and no shutdown while
+    a sortie is executing — an aircraft in the air is not a reason to close the station.
+    """
+    if body.confirmation != "SHUTDOWN":
+        raise HTTPException(status_code=400, detail="Shutdown requires the confirmation token SHUTDOWN")
+    if not (request.headers.get("X-Operator") or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Shutdown requires an X-Operator header identifying the person at the station",
+        )
+    state = get_state(request)
+    if state.mission.phase == "EXECUTING":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A sortie is executing. Abort or land the fleet first: the GCS must not close "
+                "while aircraft are airborne, even though onboard failsafes keep protecting them."
+            ),
+        )
+    state.bus.publish(
+        "operator.action",
+        {"action": "SYSTEM_SHUTDOWN", "operator": operator(request), "reason": body.reason},
+        severity="critical", source="OPERATOR", data_quality="SYSTEM",
+    )
+    stopped = await state.shutdown()
+    if not stopped.get("already_stopped"):
+        # Give the response a chance to reach the shell before the process goes. A repeat
+        # request finds the services already closed and the first exit already armed.
+        _schedule_exit()
+    return {
+        "shutting_down": True,
+        "services_stopped": stopped,
+        "note": "Capture and recorder children were closed by this process; onboard protections are unchanged.",
+    }
 
 
 # ----------------------------------------------------------------------- fleet
@@ -204,7 +290,10 @@ async def video_start(request: Request, body: VideoStartBody | None = None) -> d
 @router.post("/video/stop")
 async def video_stop(request: Request) -> dict[str, Any]:
     state = get_state(request)
-    state.video.stop()
+    # In a worker thread: stop() waits on the lifecycle token a concurrent start() holds
+    # while it enumerates capture devices. Running it here would stall every other request
+    # — including abort and recall — for as long as that enumeration takes.
+    await asyncio.to_thread(state.video.stop)
     return state.video.health()
 
 
@@ -343,7 +432,11 @@ async def upload_mission(request: Request) -> dict[str, Any]:
 async def start_mission(request: Request, body: StartBody) -> dict[str, Any]:
     state = get_state(request)
     try:
-        return state.mission.start_mission(operator(request), body.confirmation)
+        # Starting opens the recorders and touches the database; the abort and recall
+        # endpoints share this event loop, and a slow ffmpeg spawn must not be able to
+        # delay the request that brings the fleet home.
+        return await asyncio.to_thread(state.mission.start_mission, operator(request),
+                                       body.confirmation)
     except Exception as exc:
         raise http_error(exc) from exc
 
@@ -361,7 +454,8 @@ async def abort_mission(request: Request, body: ReasonBody) -> dict[str, Any]:
 async def recall(request: Request, body: ReasonBody) -> dict[str, Any]:
     state = get_state(request)
     try:
-        return state.mission.emergency_recall(operator(request), body.reason)
+        return await asyncio.to_thread(state.mission.emergency_recall, operator(request),
+                                       body.reason)
     except Exception as exc:
         raise http_error(exc) from exc
 
@@ -369,7 +463,7 @@ async def recall(request: Request, body: ReasonBody) -> dict[str, Any]:
 @router.post("/mission/recall/clear")
 async def recall_clear(request: Request) -> dict[str, Any]:
     state = get_state(request)
-    return state.mission.clear_recall(operator(request))
+    return await asyncio.to_thread(state.mission.clear_recall, operator(request))
 
 
 @router.post("/mission/reset")
@@ -383,7 +477,7 @@ async def mission_reset(request: Request) -> dict[str, Any]:
     if state.mission.phase == "EXECUTING":
         raise HTTPException(status_code=409, detail="Abort or finish the executing mission before starting a new one")
     previous = state.mission.mission_id
-    state.mission.reset_session()
+    await asyncio.to_thread(state.mission.reset_session)
     if state.simulation is not None and state.mission.mode == "SIMULATION":
         # Keep the simulated fleet alive at the pad so the operator sees the
         # same link state during the next setup without fabricating a launch.
@@ -434,6 +528,12 @@ async def recent_events(request: Request, limit: int = 100) -> dict[str, Any]:
 @router.get("/map/style")
 async def map_style(request: Request) -> dict[str, Any]:
     return get_state(request).tiles.style()
+
+
+@router.get("/map/manifest")
+async def map_manifest(request: Request) -> dict[str, Any]:
+    """Basemap provenance: which surface is on screen and where its data came from."""
+    return get_state(request).tiles.provenance()
 
 
 @router.get("/map/tiles/{z}/{x}/{y}.png")

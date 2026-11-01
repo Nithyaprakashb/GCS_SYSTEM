@@ -46,6 +46,7 @@ class MavlinkTransport:
         self.on_state = on_state
         self.name = name
         self.conn: Any = None
+        self.target_system: int | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.connected = False
@@ -69,7 +70,15 @@ class MavlinkTransport:
                     autoreconnect=True,
                 )
             # Wait for the first heartbeat without blocking app startup forever.
-            self.conn.wait_heartbeat(timeout=3.0)
+            # wait_heartbeat returns None on timeout or when the link dies: a port that
+            # merely opens is NOT a verified aircraft link, and reporting CONNECTED there
+            # would let the operator command a vehicle that has never answered.
+            heartbeat = self.conn.wait_heartbeat(timeout=3.0)
+            if heartbeat is None:
+                raise TransportError(
+                    "Serial/network port opened but no MAVLink HEARTBEAT arrived within 3 s"
+                )
+            self.target_system = int(getattr(self.conn, "target_system", 0) or 0)
             self.connected = True
             self.on_state(self.name, "CONNECTED")
         except Exception as exc:
@@ -107,8 +116,8 @@ class MavlinkTransport:
                     time.sleep(2.0)
 
     def send(self, message: Any) -> None:
-        if not self.conn:
-            raise TransportError("transport is not open")
+        if not self.conn or not self.connected:
+            raise TransportError("transport has no verified MAVLink link")
         self.conn.mav.send(message)
 
     def command_long(
@@ -120,8 +129,8 @@ class MavlinkTransport:
         *,
         confirmation: int = 0,
     ) -> None:
-        if not self.conn:
-            raise TransportError("transport is not open")
+        if not self.conn or not self.connected:
+            raise TransportError("transport has no verified MAVLink link")
         padded = (params + [0.0] * 7)[:7]
         self.conn.mav.command_long_send(
             target_system,
@@ -132,19 +141,25 @@ class MavlinkTransport:
         )
 
     def mission_count(self, target_system: int, target_component: int, count: int, mission_type: int = 0) -> None:
-        if not self.conn:
-            raise TransportError("transport is not open")
+        self._require_link()
         self.conn.mav.mission_count_send(target_system, target_component, count, mission_type)
 
     def mission_request_int(self, target_system: int, target_component: int, seq: int, mission_type: int = 0) -> None:
-        if not self.conn:
-            raise TransportError("transport is not open")
+        self._require_link()
         self.conn.mav.mission_request_int_send(target_system, target_component, seq, mission_type)
 
     def mission_request_list(self, target_system: int, target_component: int, mission_type: int = 0) -> None:
-        if not self.conn:
-            raise TransportError("transport is not open")
+        self._require_link()
         self.conn.mav.mission_request_list_send(target_system, target_component, mission_type)
+
+    def _require_link(self) -> None:
+        """Mission and parameter traffic needs the same verified link as commands.
+
+        A dropped link keeps the socket object alive; writing to it would look like a
+        successful upload to the caller while nothing reaches the vehicle.
+        """
+        if not self.conn or not self.connected:
+            raise TransportError("transport has no verified MAVLink link")
 
     def mission_item_int(
         self,
@@ -164,8 +179,7 @@ class MavlinkTransport:
         alt: float,
         mission_type: int = 0,
     ) -> None:
-        if not self.conn:
-            raise TransportError("transport is not open")
+        self._require_link()
         self.conn.mav.mission_item_int_send(
             target_system,
             target_component,
@@ -185,8 +199,7 @@ class MavlinkTransport:
         )
 
     def set_mode(self, target_system: int, target_component: int, mode_id: int) -> None:
-        if not self.conn:
-            raise TransportError("transport is not open")
+        self._require_link()
         self.conn.mav.set_mode_send(
             target_system,
             mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
@@ -194,8 +207,7 @@ class MavlinkTransport:
         )
 
     def param_set(self, target_system: int, target_component: int, name: str, value: float) -> None:
-        if not self.conn:
-            raise TransportError("transport is not open")
+        self._require_link()
         self.conn.mav.param_set_send(
             target_system,
             target_component,
@@ -205,8 +217,7 @@ class MavlinkTransport:
         )
 
     def param_request_read(self, target_system: int, target_component: int, name: str) -> None:
-        if not self.conn:
-            raise TransportError("transport is not open")
+        self._require_link()
         self.conn.mav.param_request_read_send(
             target_system, target_component, name.encode("ascii"), -1
         )

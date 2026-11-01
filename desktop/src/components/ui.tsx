@@ -1,4 +1,4 @@
-import { type CSSProperties, type ReactNode, useEffect } from "react";
+import { type CSSProperties, type ReactNode, useEffect, useId, useRef } from "react";
 import clsx from "clsx";
 import { X } from "lucide-react";
 
@@ -9,6 +9,7 @@ export function Badge({
   pulse = false,
   className,
   style,
+  title,
 }: {
   children: ReactNode;
   tone?: "ok" | "warn" | "danger" | "info" | "muted" | "accent";
@@ -16,9 +17,10 @@ export function Badge({
   pulse?: boolean;
   className?: string;
   style?: CSSProperties;
+  title?: string;
 }) {
   return (
-    <span className={clsx("badge", tone, pulse && "pulse", className)} style={style}>
+    <span className={clsx("badge", tone, pulse && "pulse", className)} style={style} title={title}>
       {dot && <span className="dot" />}
       {children}
     </span>
@@ -108,6 +110,14 @@ export function Empty({ children }: { children: ReactNode }) {
   return <div className="empty">{children}</div>;
 }
 
+/*
+ * One Escape listener for the whole app, routed to the topmost open dialog. Modals can
+ * nest — the abort confirmation sits above the expanded map modal — and when every mounted
+ * Modal registers its own window listener, one keypress closes both and the operator loses
+ * the dialog they did not mean to dismiss.
+ */
+const openDialogs: symbol[] = [];
+
 export function Modal({
   open,
   title,
@@ -115,6 +125,8 @@ export function Modal({
   footer,
   onClose,
   width,
+  ariaLabel,
+  blocking = false,
 }: {
   open: boolean;
   title: ReactNode;
@@ -122,28 +134,108 @@ export function Modal({
   footer?: ReactNode;
   onClose: () => void;
   width?: number;
+  /** Accessible name for screens whose title is JSX (an icon plus text). */
+  ariaLabel?: string;
+  /** Destructive confirmations must not close on a stray press. */
+  blocking?: boolean;
 }) {
+  const titleId = useId();
+  const bodyId = useId();
+  const panelRef = useRef<HTMLDivElement>(null);
+  /*
+   * The close handler is read through a ref because the effect below deliberately runs
+   * only when `open` flips. Most callers pass an inline arrow, so a `onClose` dependency
+   * would re-register the listener, re-capture focus and re-restore focus on every parent
+   * render — and the shell re-renders once a second for the station clock.
+   */
+  const latestClose = useRef(onClose);
+  latestClose.current = onClose;
+
   useEffect(() => {
-    if (!open) return;
+    if (!open) return undefined;
+    const token = Symbol("dialog");
+    openDialogs.push(token);
     const handler = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key !== "Escape") return;
+      if (openDialogs[openDialogs.length - 1] !== token) return;
+      event.stopPropagation();
+      latestClose.current();
     };
     window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [open, onClose]);
+    /*
+     * A dialog that swallows Tab lets focus walk straight out of the confirmation and into
+     * the live controls behind it. The abort/recall dialog is the one where an operator
+     * types a destructive token, so focus is kept inside and handed back to whatever was
+     * focused before it opened.
+     */
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    const focusables = () => Array.from(
+      panelRef.current?.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), textarea, input:not([disabled]), select, [tabindex]:not([tabindex="-1"])',
+      ) ?? [],
+    );
+    const timer = window.setTimeout(() => {
+      const targets = focusables();
+      (targets.find((node) => node instanceof HTMLInputElement && !node.disabled)
+        ?? targets[0]
+        ?? panelRef.current)?.focus();
+    }, 0);
+    const trap = (event: KeyboardEvent) => {
+      if (event.key !== "Tab" || openDialogs[openDialogs.length - 1] !== token) return;
+      const targets = focusables();
+      if (!targets.length) {
+        event.preventDefault();
+        return;
+      }
+      const first = targets[0];
+      const last = targets[targets.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey && (active === first || active === panelRef.current)) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", trap);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("keydown", handler);
+      window.removeEventListener("keydown", trap);
+      const index = openDialogs.indexOf(token);
+      if (index >= 0) openDialogs.splice(index, 1);
+      previouslyFocused?.focus?.();
+    };
+  }, [open]);
 
   if (!open) return null;
+  const namedById = typeof title === "string";
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <div className="modal" role="dialog" aria-modal="true" aria-label={typeof title === "string" ? title : "Dialog"} style={width ? { width: `min(${width}px, 100%)` } : undefined}>
+    <div
+      className="modal-backdrop"
+      role="presentation"
+      onMouseDown={(event) => !blocking && event.target === event.currentTarget && onClose()}
+    >
+      <div
+        ref={panelRef}
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        tabIndex={-1}
+        aria-labelledby={namedById ? titleId : undefined}
+        aria-label={namedById ? undefined : (ariaLabel ?? "Confirmation")}
+        aria-describedby={bodyId}
+        style={width ? { width: `min(${width}px, 100%)` } : undefined}
+      >
         <div className="modal-body">
           <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
-            <h2 className="modal-title" style={{ flex: 1 }}>{title}</h2>
+            <h2 id={namedById ? titleId : undefined} className="modal-title" style={{ flex: 1 }}>{title}</h2>
             <button className="icon-button" onClick={onClose} aria-label="Close dialog">
               <X size={15} />
             </button>
           </div>
-          {children}
+          <div id={bodyId}>{children}</div>
         </div>
         {footer && <div className="modal-actions">{footer}</div>}
       </div>

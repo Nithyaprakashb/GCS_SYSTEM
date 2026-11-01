@@ -89,6 +89,20 @@ Baud is 57 600 by default and must match the RFD serial setting.
 `command_retries` is present in the configuration but not yet implemented;
 commands are single-shot with a `TIMEOUT` result rather than silently retried.
 
+**The station does not transmit a MAVLink `HEARTBEAT`.** It listens to the aircraft's
+heartbeats and answers their requests, but as a ground component it stays silent, so the
+autopilot cannot see it. Consequences for commissioning:
+
+- `FS_GCS_ENABLE` must remain 0. Enabling it before a heartbeat sender exists makes
+  link loss *more* dangerous, not less — the aircraft would react to a GCS it was never
+  told about. `SYSID_MYGCS` is likewise not written. See §6 of `MAVLINK_MAPPING.md`.
+- Link quality comes from `RADIO_STATUS.rssi` only. Packet loss, rx-available rate and
+  round-trip latency are **not computed**, and the UI reports them as unavailable. If the
+  modem exposes its own diagnostics, recording them is commissioning work this build does
+  not do for you.
+- Port enumeration proves a device is present. It never proves a pairing: the GCS does not
+  assume any detected COM port is the RFD868x.
+
 ---
 
 ## 3. Analog video (TX800 / RunCam)
@@ -131,6 +145,16 @@ Rules enforced by the software:
 REAL capture is implemented but **PENDING TEST** on the actual capture devices.
 `device_fingerprint` and `mapped` must be filled during commissioning.
 
+Two things commissioning has to do that this build cannot do for you:
+
+- **Capture formats are not enumerated.** The reader accepts whatever resolution and frame
+  rate the OS hands it; nothing queries the device's supported modes, and nothing warns you
+  if the receiver presents a format the recorder will re-time. Requirement `FR-004`, fix row `44`.
+- **The telemetry HUD overlay exists only on the synthetic feed.** Real analog frames pass
+  through un-overlaid, because the station cannot timestamp-match a picture it does not
+  generate; `latency_basis` reports `NOT_MEASURED` rather than guessing. Requirement `FR-073`,
+  fix row `43`.
+
 ---
 
 ## 4. Payload mechanism
@@ -157,6 +181,12 @@ beam evidence. Physical servo channel, PWM values and beam polarity are
 - Three USB video capture devices for the TX800 receivers.
 - Local disk for evidence: SQLite database, per-mission folders, JSONL logs, video
   recordings and PDF reports.
+- Local basemap, built before the station goes to the field. Place a Geofabrik regional
+  `.osm.pbf` at `map/india-261030.osm.pbf`, then
+  `python tools/offline_map.py extract` and `python tools/offline_map.py build --zooms 10-16`.
+  Tiles land in `data/map_tiles/` with a manifest; `GET /api/map/manifest` reports which
+  surface is on screen and the extract's data date. Without a pack the map still works, on
+  the procedural reference surface, and says so.
 - The backend binds only to `127.0.0.1`; the Electron window is the only client.
 
 Recommended pre-mission check: run `GET /api/system/diagnostics` and confirm the

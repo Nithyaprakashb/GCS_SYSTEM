@@ -1,13 +1,22 @@
-"""Offline procedural tactical basemap tiles.
+"""Offline tactical basemap tiles, with two distinct sources that are never confused.
 
-The map never contacts an online tile service. Tiles are generated locally from a
-deterministic terrain field and cached on disk. They are a *reference* surface,
-not satellite imagery or surveyed terrain; the mission geometry on top is exact.
+The map never contacts an online tile service. Tiles come from one of two places:
+
+1. an OpenStreetMap tile pack rendered by `tools/offline_map.py` and recorded in
+   `data/map_tiles/map_manifest.json` — real streets, lakes and buildings, read from a
+   regional .pbf at build time;
+2. the procedural reference surface generated below from a deterministic terrain field,
+   which fills every tile the pack does not cover.
+
+Which one the operator is looking at is published by `provenance()` and carried in the
+style attribution, because "the map is wrong" and "the map is honest but coarse" are very
+different problems. The mission geometry on top is exact either way.
 """
 
 from __future__ import annotations
 
 import io
+import json
 import math
 import threading
 from pathlib import Path
@@ -21,6 +30,8 @@ from .config import data_dir
 TILE_SIZE = 256
 MIN_ZOOM = 10
 MAX_ZOOM = 17
+MANIFEST = "map_manifest.json"
+PROCEDURAL_ATTRIBUTION = "Procedural offline reference · not satellite imagery"
 
 
 def _tile_bounds(z: int, x: int, y: int) -> tuple[float, float, float, float]:
@@ -42,23 +53,105 @@ class MapTileService:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._memory: dict[tuple[int, int, int], bytes] = {}
         self._lock = threading.RLock()
+        self._manifest: dict[str, Any] | None = None
+        self._manifest_stamp: tuple[float, int] | None = None
+
+    # ------------------------------------------------------------------ manifest
+    def manifest(self) -> dict[str, Any] | None:
+        """The tile pack's own record of where it came from, re-read if it changed.
+
+        A rebuild while the service runs should not need a restart to be reported
+        honestly, so the check is the file's mtime and size rather than a flag.
+        """
+        path = self.cache_dir / MANIFEST
+        try:
+            stat = path.stat()
+            stamp = (stat.st_mtime, stat.st_size)
+        except OSError:
+            with self._lock:
+                self._manifest = None
+                self._manifest_stamp = None
+            return None
+        with self._lock:
+            if self._manifest is not None and self._manifest_stamp == stamp:
+                return self._manifest
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # A half-written manifest must not take the map down; treat it as no pack.
+            raw = None
+        with self._lock:
+            self._manifest = raw if isinstance(raw, dict) else None
+            self._manifest_stamp = stamp
+        return self._manifest
+
+    def pack_max_zoom(self) -> int | None:
+        manifest = self.manifest()
+        if not manifest:
+            return None
+        zooms = ((manifest.get("coverage") or {}).get("zooms")) or []
+        numbers = [int(z) for z in zooms if str(z).lstrip("-").isdigit()]
+        return max(numbers) if numbers else None
+
+    def provenance(self) -> dict[str, Any]:
+        """What the operator is actually looking at, for the style and the UI badge."""
+        manifest = self.manifest()
+        if not manifest:
+            return {
+                "kind": "procedural",
+                "label": "Procedural reference surface",
+                "attribution": [PROCEDURAL_ATTRIBUTION],
+                "network_access": False,
+                "pack_zooms": [],
+                "coverage_deg": None,
+                "osm_data_date": None,
+                "note": ("No OpenStreetMap tile pack is installed. Run "
+                         "`python tools/offline_map.py extract` then `build` to render one."),
+            }
+        coverage = manifest.get("coverage") or {}
+        boxes = coverage.get("zoom_boxes_deg") or {}
+        metro = coverage.get("metro_bbox_deg")
+        return {
+            "kind": "openstreetmap-offline-pack",
+            "label": "OpenStreetMap offline tile pack",
+            "attribution": list(manifest.get("attribution") or []),
+            "network_access": False,
+            "pack_zooms": sorted(int(z) for z in coverage.get("zooms") or []),
+            "coverage_deg": metro or (min((v[0] for v in boxes.values()), default=None),
+                                      min((v[1] for v in boxes.values()), default=None),
+                                      max((v[2] for v in boxes.values()), default=None),
+                                      max((v[3] for v in boxes.values()), default=None)),
+            "osm_data_date": (manifest.get("source") or {}).get("osm_data_date"),
+            "built_at": manifest.get("built_at"),
+            "layers": manifest.get("layers") or {},
+            "simplifications": list(manifest.get("simplifications") or []),
+            "note": ("Tiles inside the recorded boxes are rendered from OpenStreetMap data. "
+                     "Anywhere else the surface is the procedural reference."),
+        }
 
     def style(self) -> dict[str, Any]:
+        provenance = self.provenance()
+        pack = provenance["kind"] == "openstreetmap-offline-pack"
+        # Declaring the source max zoom is what makes MapLibre over-zoom a real OSM tile
+        # instead of requesting a zoom the pack has never rendered.
+        source_max = max(MIN_ZOOM, min(MAX_ZOOM, self.pack_max_zoom() or MIN_ZOOM)) if pack else MAX_ZOOM
+        attribution = " · ".join(provenance["attribution"]) if pack else PROCEDURAL_ATTRIBUTION
         return {
             "version": 8,
             "name": "RescueSwarm Offline Tactical",
             "metadata": {
-                "rescue-swarm:basemap": "procedural-offline",
-                "rescue-swarm:note": "Local reference surface, not satellite imagery.",
+                "rescue-swarm:basemap": provenance["kind"],
+                "rescue-swarm:note": provenance["note"],
+                "rescue-swarm:osm_data_date": provenance.get("osm_data_date"),
             },
             "sources": {
                 "offline-terrain": {
                     "type": "raster",
-                    "tiles": ["/api/map/tiles/{z}/{x}/{y}.png?v=2"],
+                    "tiles": ["/api/map/tiles/{z}/{x}/{y}.png?v=3"],
                     "tileSize": TILE_SIZE,
                     "minzoom": MIN_ZOOM,
-                    "maxzoom": MAX_ZOOM,
-                    "attribution": "Procedural offline reference · not satellite imagery",
+                    "maxzoom": source_max,
+                    "attribution": attribution,
                 }
             },
             "layers": [
@@ -74,6 +167,25 @@ class MapTileService:
             ],
         }
 
+    def _cached_path(self, z: int, x: int, y: int, suffix: str) -> Path:
+        return self.cache_dir / str(z) / str(x) / f"{y}{suffix}.png"
+
+    def _overzoom_source(self, z: int, x: int, y: int, suffix: str) -> Path | None:
+        """A tile above the pack's top zoom, served by up-scaling its covered parent.
+
+        MapLibre normally over-zooms on its own once the style declares the source max
+        zoom, but the tile endpoint can also be hit directly (a print, a replay export,
+        a hand-typed URL). Returning the parent OSM tile keeps those views honest; the
+        alternative — falling through to the procedural field — would silently replace
+        real streets with invented ones at the zoom where the operator looks closest.
+        """
+        pack_max = self.pack_max_zoom()
+        if pack_max is None or z <= pack_max:
+            return None
+        shift = z - pack_max
+        candidate = self._cached_path(pack_max, x >> shift, y >> shift, suffix)
+        return candidate if candidate.exists() else None
+
     def tile(self, z: int, x: int, y: int, light: bool = False) -> bytes:
         z = max(MIN_ZOOM, min(MAX_ZOOM, z))
         key = (z, x, y, light)
@@ -81,7 +193,9 @@ class MapTileService:
             if key in self._memory:
                 return self._memory[key]
         suffix = "-light" if light else ""
-        path = self.cache_dir / str(z) / str(x) / f"{y}{suffix}.png"
+        path = self._cached_path(z, x, y, suffix)
+        if not path.exists():
+            path = self._overzoom_source(z, x, y, suffix) or path
         if path.exists():
             data = path.read_bytes()
             with self._lock:

@@ -26,6 +26,8 @@ let mainWindow = null;
 let backend = null;
 let backendLog = null;
 let quitting = false;
+let stopRequested = false;
+let stopComplete = false;
 
 const logDir = () => path.join(app.getPath("userData"), "logs");
 const dataDir = () => path.join(app.getPath("userData"), "data");
@@ -55,6 +57,16 @@ function frontendDir() {
 function pythonExecutable() {
   if (process.env.RESCUESWARM_PYTHON) return process.env.RESCUESWARM_PYTHON;
   return process.platform === "win32" ? "python" : "python3";
+}
+
+/**
+ * Who is standing at this station. Evidence records attribute every command to it; it is
+ * a local Windows/POSIX account name, not an authentication assertion, and it is never
+ * used to authorise anything on its own.
+ */
+function stationOperator() {
+  const name = process.env.USERNAME || process.env.USER || process.env.LOGNAME || "";
+  return String(name).trim().slice(0, 64) || "station-operator";
 }
 
 async function healthy() {
@@ -256,6 +268,7 @@ if (!gotSingleInstanceLock) {
       backendUrl: BACKEND_URL,
       packaged: PACKAGED,
       appVersion: app.getVersion(),
+      operator: stationOperator(),
       dataDir: dataDir(),
       logDir: logDir(),
       versions: {
@@ -283,16 +296,84 @@ if (!gotSingleInstanceLock) {
     if (process.platform !== "darwin") app.quit();
   });
 
-  app.on("before-quit", () => {
-    quitting = true;
-    if (backend && !backend.killed) {
-      logLine("Stopping local backend");
-      try {
-        backend.kill();
-      } catch (error) {
-        logLine(`Backend stop error: ${error && error.message}`);
-      }
-      backend = null;
+  /**
+   * Ask the backend to close its own children over loopback.
+   *
+   * On Windows child.kill() is TerminateProcess: it gives the Python process no chance
+   * to run its teardown, so ffmpeg grandchildren survive the station and keep holding the
+   * TX800 capture devices, and buffered evidence can still be in the event queue. The
+   * shutdown endpoint stops capture, recording and telemetry, drains the writer, closes
+   * the database and exits with code 0. The kill below is only the escalation.
+   */
+  async function requestBackendShutdown(reason) {
+    try {
+      const controller = new AbortController();
+      /* Orderly teardown joins capture threads, so allow generously for it. */
+      const timer = setTimeout(() => controller.abort(), 20000);
+      const response = await fetch(`${BACKEND_URL}/api/system/shutdown`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Operator": stationOperator(),
+        },
+        body: JSON.stringify({ confirmation: "SHUTDOWN", reason }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      return response.ok;
+    } catch (error) {
+      logLine(`Shutdown request failed: ${error && error.message}`);
+      return false;
     }
+  }
+
+  function killBackendTree(child, reason) {
+    logLine(`Escalating backend stop (${reason}) for pid ${child.pid}`);
+    if (process.platform === "win32") {
+      // /T walks the process tree, which is the only way to reach the ffmpeg capture
+      // and recorder children the Python process owns.
+      const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
+      killer.on("error", (error) => logLine(`taskkill failed: ${error.message}`));
+    } else {
+      try {
+        child.kill("SIGKILL");
+      } catch (error) {
+        logLine(`Force kill failed: ${error && error.message}`);
+      }
+    }
+  }
+
+  app.on("before-quit", (event) => {
+    if (stopComplete) return;            // teardown already ran: let Electron finish closing
+    event.preventDefault();
+    if (stopRequested) return;           // a second close attempt during the wait
+    stopRequested = true;
+    quitting = true;
+    const child = backend;
+    logLine("Station closing: requesting an orderly backend stop");
+
+    const finish = () => {
+      stopComplete = true;
+      app.quit();
+    };
+
+    requestBackendShutdown("Station closed").then((acknowledged) => {
+      if (!acknowledged) logLine("Backend did not acknowledge the shutdown request");
+      if (!child) {
+        /* Backend was reused from another station process: nothing of ours to wait for. */
+        finish();
+        return;
+      }
+      const deadline = Date.now() + 15000;
+      const poll = () => {
+        if (!backend) return finish();          // the child's 'exit' event cleared it
+        if (Date.now() >= deadline) {
+          killBackendTree(child, "graceful shutdown timed out");
+          return finish();
+        }
+        setTimeout(poll, 200);
+      };
+      poll();
+    });
   });
 }

@@ -27,6 +27,33 @@ FENCE_POLYGON_INCLUSION = 5001
 FENCE_RETURN_POINT = 5002
 MAV_FRAME_GLOBAL_INT = 5
 
+# ArduPilot answers MISSION_REQUEST_INT with the INT alias of the frame that was
+# sent (GLOBAL ↔ GLOBAL_INT, GLOBAL_RELATIVE_ALT ↔ GLOBAL_RELATIVE_ALT_INT,
+# TERRAIN_ALT ↔ TERRAIN_ALT_INT), so only a different frame *class* is a real
+# mismatch. Values verified against the installed pymavlink 2.4.50 common dialect.
+FRAME_CLASSES = {
+    0: "global", 5: "global",
+    3: "global_relative_alt", 6: "global_relative_alt",
+    10: "global_terrain_alt", 11: "global_terrain_alt",
+    2: "mission",
+    1: "local", 4: "local", 7: "local_offset", 20: "local", 21: "local",
+    8: "body", 9: "body_offset", 12: "body",
+}
+
+# A coordinate that differs by more than ~0.11 m is a different waypoint. MISSION_ITEM_INT
+# carries integer 1e-7 degrees, so this is the smallest tolerance that is not pure float noise.
+COORD_TOL_DEG = 1e-6
+ALT_TOL_M = 0.2
+PARAM_TOL = 1e-3
+
+
+def _frame_class(frame: Any) -> str:
+    """Normalise a MAV_FRAME id to its class, or 'unknown' when it is not a frame."""
+    try:
+        return FRAME_CLASSES.get(int(frame), "unknown")
+    except (TypeError, ValueError):
+        return "unknown"
+
 
 class UploadError(RuntimeError):
     pass
@@ -130,29 +157,22 @@ class MissionUploader:
         params = self._parameter_plan(callsign, plan)
         streams["parameters"] = self._set_and_verify_params(callsign, profile["sysid"], params)
 
-        statuses = [stream.get("status") for stream in streams.values()]
-        if all(status in {"VERIFIED", "NOT_REQUIRED"} for status in statuses):
-            status = "VERIFIED"
-        elif any(status == "VERIFIED" for status in statuses):
-            status = "PARTIAL"
-        elif all(status == "FAIL" for status in statuses):
-            status = "FAILED"
-        else:
-            status = "UNVERIFIED"
+        status = self._overall_status(streams, mission_required=bool(mission_items))
         wire = {}
         for stream_name, stream in streams.items():
-            wire[stream_name] = {
+            entry = {
                 "status": stream.get("status"),
                 "count": stream.get("count"),
                 "detail": stream.get("detail"),
                 "simulated": False,
             }
+            if stream.get("mismatches"):
+                entry["mismatches"] = stream["mismatches"][:12]
+            wire[stream_name] = entry
         return {
             "callsign": callsign,
             "status": status,
-            "detail": "; ".join(
-                f"{name}: {stream.get('status')}" for name, stream in streams.items()
-            ),
+            "detail": self._receipt_detail(streams),
             "plan_hash": plan.get("plan_hash"),
             "mission_count": len(mission_items),
             "fence_count": len(fence_items),
@@ -162,6 +182,36 @@ class MissionUploader:
             "verified_at": iso_now(),
             "streams": wire,
         }
+
+    @staticmethod
+    def _overall_status(streams: dict[str, Any], mission_required: bool) -> str:
+        """Aggregate per-stream results by what the aircraft actually needs to fly safely.
+
+        The fence and, for a search aircraft, the mission are flight-critical: a receipt
+        must not read PARTIAL when the thing that failed is the one that protects the
+        vehicle. Parameters sit below them because a written-but-unreadable parameter is
+        still a parameter the vehicle may already hold.
+        """
+        critical = ["fence"] + (["mission"] if mission_required else [])
+        for name in critical:
+            stream_status = (streams.get(name) or {}).get("status")
+            if stream_status == "FAIL":
+                return "FAILED"
+            if stream_status != "VERIFIED":
+                return "UNVERIFIED"
+        if (streams.get("parameters") or {}).get("status") not in {"VERIFIED", "NOT_REQUIRED"}:
+            return "PARTIAL"
+        return "VERIFIED"
+
+    @staticmethod
+    def _receipt_detail(streams: dict[str, Any]) -> str:
+        summary = "; ".join(f"{name}: {stream.get('status')}" for name, stream in streams.items())
+        first_problem = next(
+            (stream.get("detail") for stream in streams.values()
+             if stream.get("status") not in {"VERIFIED", "NOT_REQUIRED"} and stream.get("detail")),
+            None,
+        )
+        return f"{summary}. {first_problem}" if first_problem else summary
 
     def _transport(self, callsign: str) -> Any:
         transport = self.telemetry.transports.get(callsign) or self.telemetry.shared_transport
@@ -181,14 +231,14 @@ class MissionUploader:
             upload = self._upload(callsign, transport, sysid, items, mission_type)
             if upload["status"] != "VERIFIED":
                 return upload
-            readback = self._readback(callsign, transport, sysid, mission_type)
+            readback = self._readback(callsign, transport, sysid, mission_type, items)
             if readback["status"] != "VERIFIED":
                 readback["detail"] = f"Upload acknowledged but {readback.get('detail', 'read-back failed')}"
                 return readback
             return {
                 "status": "VERIFIED",
                 "count": len(items),
-                "detail": "Upload and read-back match",
+                "detail": "Upload and read-back match item by item",
             }
         except Exception as exc:
             return {"status": "FAIL", "count": len(items), "detail": str(exc)}
@@ -224,6 +274,7 @@ class MissionUploader:
         transport: Any,
         sysid: int,
         mission_type: int,
+        expected_items: list[dict[str, Any]],
     ) -> dict[str, Any]:
         session = _Session("readback")
         with self._lock:
@@ -241,11 +292,54 @@ class MissionUploader:
                     "status": "FAIL",
                     "detail": f"Read-back returned {len(session.received)}/{session.expected} items",
                 }
+            # A matching count proves nothing about content: a shifted or stale
+            # mission of the same length would otherwise be reported VERIFIED.
+            mismatches = self._compare_items(expected_items, session.received)
+            if mismatches:
+                return {
+                    "status": "FAIL",
+                    "count": session.expected,
+                    "detail": "Read-back differs from the uploaded items: "
+                              + "; ".join(mismatches[:6])
+                              + (f" (+{len(mismatches) - 6} more)" if len(mismatches) > 6 else ""),
+                    "mismatches": mismatches,
+                }
             return {"status": "VERIFIED", "count": session.expected, "items": session.received}
         finally:
             with self._lock:
                 if self._sessions.get(callsign) is session:
                     self._sessions.pop(callsign, None)
+
+    @staticmethod
+    def _compare_items(expected: list[dict[str, Any]],
+                       received: dict[int, dict[str, Any]]) -> list[str]:
+        """Compare every read-back waypoint against what was actually sent."""
+        problems: list[str] = []
+        for seq, sent in enumerate(expected):
+            got = received.get(seq)
+            if not got:
+                problems.append(f"#{seq} missing from read-back")
+                continue
+            if int(got.get("command", -1)) != int(sent["command"]):
+                problems.append(f"#{seq} command {got.get('command')} != {sent['command']}")
+            if _frame_class(got.get("frame")) != _frame_class(sent["frame"]):
+                problems.append(f"#{seq} frame {got.get('frame')} != {sent['frame']}")
+            for key, wire_key in (("lat", "lat"), ("lon", "lon")):
+                want, have = float(sent[key]), got.get(wire_key)
+                if have is None or abs(want - float(have)) > COORD_TOL_DEG:
+                    problems.append(f"#{seq} {key} {have} != {want}")
+            want_alt, have_alt = float(sent["alt"]), got.get("alt")
+            if have_alt is None or abs(want_alt - float(have_alt)) > ALT_TOL_M:
+                problems.append(f"#{seq} altitude {have_alt} != {want_alt}")
+            for index in range(1, 5):
+                param = f"p{index}"
+                want_p, have_p = float(sent.get(param, 0.0)), float(got.get(param, 0.0))
+                if abs(want_p - have_p) > PARAM_TOL:
+                    problems.append(f"#{seq} {param} {have_p} != {want_p}")
+        extra = set(received) - set(range(len(expected)))
+        if extra:
+            problems.append(f"read-back contains unexpected sequences {sorted(extra)}")
+        return problems
 
     def _set_and_verify_params(
         self, callsign: str, sysid: int, params: dict[str, float]
@@ -342,6 +436,10 @@ class MissionUploader:
                         "lat": msg.x / 1e7,
                         "lon": msg.y / 1e7,
                         "alt": float(msg.z),
+                        "p1": float(msg.param1),
+                        "p2": float(msg.param2),
+                        "p3": float(msg.param3),
+                        "p4": float(msg.param4),
                     }
                     if session.expected is not None and len(session.received) >= session.expected:
                         session.done.set()
@@ -379,13 +477,25 @@ class MissionUploader:
 
     @staticmethod
     def _mission_item(item: dict[str, Any]) -> dict[str, Any]:
+        """Map a plan waypoint to the wire fields, carrying any authored parameters.
+
+        The shipped planner emits TAKEOFF / WAYPOINT / RTL with no params, but a
+        hand-authored or imported mission may set them. Dropping them silently would
+        upload a different mission than the one the operator approved.
+        """
+        params = item.get("params") if isinstance(item.get("params"), dict) else {}
+        def param(index: int) -> float:
+            for source in (f"p{index}", f"param{index}"):
+                if item.get(source) is not None:
+                    return float(item[source])
+            return float(params.get(source, 0.0))
         return {
             "frame": int(item.get("frame", 6)),
             "command": int(item["command"]),
             "lat": float(item["lat"]),
             "lon": float(item["lon"]),
             "alt": float(item.get("alt_m", 0.0)),
-            "p1": 0.0, "p2": 0.0, "p3": 0.0, "p4": 0.0,
+            "p1": param(1), "p2": param(2), "p3": param(3), "p4": param(4),
         }
 
     def _fence_items(self, geofence: dict[str, Any]) -> list[dict[str, Any]]:
@@ -395,7 +505,7 @@ class MissionUploader:
         # A closed ring repeats the first vertex; ArduPilot expects unique vertices.
         vertices = polygon[:-1] if polygon[0] == polygon[-1] else polygon
         items = []
-        for index, point in enumerate(vertices):
+        for point in vertices:
             lon, lat = float(point[0]), float(point[1])
             items.append({
                 "frame": MAV_FRAME_GLOBAL_INT,
@@ -415,9 +525,14 @@ class MissionUploader:
     def _parameter_plan(self, callsign: str, plan: dict[str, Any]) -> dict[str, float]:
         profile = self.config.vehicle(callsign)
         fence = plan.get("geofences", {}).get(callsign, {})
+        # FENCE_TYPE is a bitmask: 1 = altitude, 2 = circle/map, 4 = inclusion polygon.
+        # The plan authors a polygon and an altitude ceiling but no circle radius, so
+        # enabling bit 1 would arm a breach monitor whose trigger distance is whatever
+        # FENCE_RADIUS happens to hold on the vehicle. Circle protection is therefore
+        # deliberately left off; enabling it needs a plan field and a hardware test.
         params = {
             "FENCE_ENABLE": 1.0,
-            "FENCE_TYPE": 7.0,  # altitude + circle + polygon
+            "FENCE_TYPE": 5.0,  # altitude + inclusion polygon
             "FENCE_ACTION": 1.0,  # RTL
             "FENCE_ALT_MAX": float(fence.get("max_alt_m", 50.0)),
             "RTL_ALT": float(profile.get("rtl_alt_m", 25.0)) * 100.0,

@@ -25,8 +25,8 @@ import {
 } from "lucide-react";
 import clsx from "clsx";
 import { api } from "../lib/api";
-import type { MissionPlan, UploadReceipt } from "../lib/types";
-import { fmtDistance, fmtNumber, humanise, statusTone } from "../lib/format";
+import type { MissionPlan, MissionStatus, UploadReceipt } from "../lib/types";
+import { evidenceQuality, fmtDistance, fmtNumber, humanise, qualityTone, statusTone } from "../lib/format";
 import { Badge, Modal, Notice, Panel } from "../components/ui";
 import { TacticalMap } from "../components/TacticalMap";
 import { useGcs } from "../state/GcsContext";
@@ -41,6 +41,12 @@ interface Diagnostic {
   status: string;
   detail: string;
 }
+
+/*
+ * Provenance comes from `evidenceQuality` in ../lib/format, shared with the mission screen:
+ * a REAL session with no heartbeats has no evidence, and a mixed fleet (one aircraft linked,
+ * two lost) must not be reported as LIVE.
+ */
 
 const STAGES = [
   { id: 0, title: "System & links", sub: "Initialise GCS, telemetry and video" },
@@ -287,7 +293,7 @@ export function SetupScreen({ onMission }: Props) {
               onConnect={connectFleet}
               onVideo={() => void run("Initialise video", () => api.videoStart(mission?.mode), "Video service started")}
               onContinue={() => setStage(1)}
-              topologyVerified={Boolean((fleet as { topology?: { verified?: boolean } } | undefined)?.topology?.verified)}
+              topologyVerified={Boolean(fleet?.topology_commissioned)}
             />
           )}
 
@@ -302,6 +308,8 @@ export function SetupScreen({ onMission }: Props) {
               onFile={importFile}
               plan={mission?.plan ?? null}
               vehicles={vehicles}
+              limits={mission?.limits}
+              provenance={evidenceQuality(state)}
               onBack={() => setStage(0)}
               onContinue={() => setStage(2)}
             />
@@ -313,6 +321,7 @@ export function SetupScreen({ onMission }: Props) {
               plan={(mission?.plan as MissionPlan | null) ?? null}
               vehicles={vehicles}
               busy={busy}
+              provenance={evidenceQuality(state)}
               onGenerate={generatePlan}
               onBack={() => setStage(1)}
               onContinue={() => setStage(3)}
@@ -417,6 +426,23 @@ function SystemStage({
   topologyVerified: boolean;
 }) {
   const [selected, setSelected] = useState<"SIMULATION" | "REAL">(mode === "REAL" ? "REAL" : "SIMULATION");
+  /*
+   * The safety engine reports itself through the startup diagnostics. Showing a fixed
+   * green "ARMED" here would claim a protection state the station has not measured, so
+   * the card reflects what the backend actually answered — including "UNKNOWN" when it
+   * has not answered yet.
+   */
+  const safetyCheck = diagnostics.find((check) => check.check_id === "safety");
+  const safetyTone =
+    safetyCheck?.status === "PASS" ? "var(--ok)"
+      : safetyCheck?.status === "WARN" ? "var(--warn)"
+        : safetyCheck?.status === "FAIL" ? "var(--danger)"
+          : "var(--muted)";
+  const safetyLabel =
+    safetyCheck?.status === "PASS" ? "RUNNING"
+      : safetyCheck?.status === "WARN" ? "CHECK"
+        : safetyCheck?.status === "FAIL" ? "FAULTED"
+          : "UNKNOWN";
   return (
     <>
       <div className="setup-heading">
@@ -466,8 +492,8 @@ function SystemStage({
         </div>
         <div className="metric-card">
           <div className="micro">Safety engine</div>
-          <div className="value" style={{ color: "var(--ok)" }}>ARMED</div>
-          <div className="sub">Independent of UI and AI</div>
+          <div className="value" style={{ color: safetyTone }}>{safetyLabel}</div>
+          <div className="sub">{safetyCheck?.detail ?? "Deterministic engine has not reported yet"}</div>
         </div>
       </div>
 
@@ -522,6 +548,8 @@ function AreaStage({
   onFile,
   plan,
   vehicles,
+  limits,
+  provenance,
   onBack,
   onContinue,
 }: {
@@ -534,9 +562,32 @@ function AreaStage({
   onFile: (file: File) => void;
   plan: MissionPlan | null;
   vehicles: import("../lib/types").Vehicle[] | Record<string, import("../lib/types").Vehicle> | undefined;
+  limits: MissionStatus["limits"];
+  provenance: string;
   onBack: () => void;
   onContinue: () => void;
 }) {
+  /*
+   * Every number below is read from the plan the backend just computed or from the limits
+   * the safety rules actually consult. A hard-coded "12 m AGL" here would keep advertising
+   * the old profile after someone changed it, and an operator would launch believing a
+   * clearance floor the station is not enforcing.
+   */
+  const inputs = plan?.estimate?.inputs;
+  const profile: { k: string; v: string | null; sub?: string }[] = [
+    {
+      k: "Search altitude",
+      v: inputs?.search_altitude_m !== undefined ? `${fmtNumber(inputs.search_altitude_m, 1)} m AGL` : null,
+    },
+    { k: "Search speed", v: inputs?.search_speed_ms !== undefined ? `${fmtNumber(inputs.search_speed_ms, 1)} m/s` : null },
+    { k: "Survivor cap", v: limits?.max_survivors !== undefined ? String(limits.max_survivors) : null },
+    { k: "Merge radius", v: limits?.merge_distance_m !== undefined ? `${fmtNumber(limits.merge_distance_m, 1)} m` : null },
+    {
+      k: "Release clearance",
+      v: limits?.descent_clearance_m !== undefined ? `${fmtNumber(limits.descent_clearance_m, 1)} m` : null,
+    },
+  ];
+
   return (
     <>
       <div className="setup-heading">
@@ -596,7 +647,7 @@ function AreaStage({
         </div>
       ) : (
         <div className="setup-cards" style={{ gridTemplateColumns: "minmax(0, 1fr) 280px" }}>
-          <TacticalMap aoi={aoi} plan={plan} vehicles={vehicles} className="" />
+          <TacticalMap aoi={aoi} plan={plan} vehicles={vehicles} provenance={provenance} className="" />
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             <Panel title="Boundary" icon={<MapIcon size={13} />}>
               <div className="kv"><span className="k">Area</span><span className="v mono">{aoi.area_ha.toFixed(3)} ha</span></div>
@@ -605,11 +656,18 @@ function AreaStage({
               <div className="kv"><span className="k">Source hash</span><span className="v mono" title={aoi.source_hash}>{aoi.source_hash?.slice(0, 12)}…</span></div>
             </Panel>
             <Panel title="Mission profile" icon={<Gauge size={13} />}>
-              <div className="kv"><span className="k">Search altitude</span><span className="v mono">12 m AGL</span></div>
-              <div className="kv"><span className="k">Search speed</span><span className="v mono">8 m/s</span></div>
-              <div className="kv"><span className="k">Survivor cap</span><span className="v mono">10</span></div>
-              <div className="kv"><span className="k">Merge radius</span><span className="v mono">5 m</span></div>
-              <div className="kv"><span className="k">Release clearance</span><span className="v mono">20 m</span></div>
+              {profile.map((row) => (
+                <div className="kv" key={row.k}>
+                  <span className="k">{row.k}</span>
+                  <span className="v mono">{row.v ?? "—"}</span>
+                </div>
+              ))}
+              <div className="divider" />
+              <div className="small muted" style={{ lineHeight: 1.5 }}>
+                {plan
+                  ? "Read from the generated plan and the fleet profile limits the safety rules consult."
+                  : "Values appear once a plan is generated; the station does not advertise limits it has not computed."}
+              </div>
             </Panel>
             <button className="btn" onClick={onSample} disabled={busy !== null}>Replace with sample</button>
           </div>
@@ -637,6 +695,7 @@ function PlanStage({
   plan,
   vehicles,
   busy,
+  provenance,
   onGenerate,
   onBack,
   onContinue,
@@ -645,17 +704,23 @@ function PlanStage({
   plan: MissionPlan | null;
   vehicles: import("../lib/types").Vehicle[] | Record<string, import("../lib/types").Vehicle> | undefined;
   busy: string | null;
+  provenance: string;
   onGenerate: () => void;
   onBack: () => void;
   onContinue: () => void;
 }) {
+  const inputs = plan?.estimate?.inputs;
+  const speed = inputs?.search_speed_ms;
+  const fences = Object.values(plan?.geofences ?? {});
+  const ceilings = fences.map((fence) => fence.max_alt_m).filter((value) => typeof value === "number") as number[];
+  const inset = inputs?.lane_inset_m ?? plan?.search?.lane_inset_m;
   return (
     <>
       <div className="setup-heading">
         <div>
           <div className="micro">Stage 03 · Deterministic flight plan</div>
           <h1>Generate the lawnmower search</h1>
-          <p>Fixed heading, minimum rotated rectangle, 20% image overlap and 3 m boundary inset. Every number is calculated, never hand-tuned at runtime.</p>
+          <p>Fixed heading along the minimum rotated rectangle, with lane ends inset from the boundary. Overlap, inset, altitude and speed are read from the fleet profile — the values actually used are shown on this plan, never quoted from a default.</p>
         </div>
         {plan && <Badge tone={plan.validation?.ok ? "ok" : "danger"} dot>{plan.validation?.ok ? "Validated" : "Invalid"}</Badge>}
       </div>
@@ -665,8 +730,8 @@ function PlanStage({
           <div className="empty" style={{ padding: 34 }}>
             <ScanLine size={26} style={{ color: "var(--accent)" }} />
             <div style={{ maxWidth: 420, lineHeight: 1.6 }}>
-              The planner computes lane spacing from the 23.7 m camera swath at 12 m AGL, then fits the minimum
-              number of complete lanes inside the boundary. No manual waypoint editing is required.
+              The planner derives lane spacing from the camera swath at the profiled search altitude, then fits the
+              minimum number of complete lanes inside the boundary. No manual waypoint editing is required.
             </div>
             <button className="btn primary" onClick={onGenerate} disabled={busy !== null || !aoi} style={{ marginTop: 6 }}>
               Generate plan
@@ -678,21 +743,28 @@ function PlanStage({
           <div className="setup-cards">
             <div className="metric-card"><div className="micro">Search lanes</div><div className="value">{plan.search.lane_count}</div><div className="sub">{fmtNumber(plan.search.lane_spacing_m, 2)} m spacing · {fmtNumber(plan.search.usable_swath_m, 1)} m swath</div></div>
             <div className="metric-card"><div className="micro">Path length</div><div className="value">{fmtNumber(plan.search.path_length_m / 1000, 2)}<span style={{ fontSize: 13, color: "var(--muted)" }}> km</span></div><div className="sub">Serpentine, fixed heading</div></div>
-            <div className="metric-card"><div className="micro">Search duration</div><div className="value">{fmtNumber((plan.search.search_time_s ?? 0) / 60, 1)}<span style={{ fontSize: 13, color: "var(--muted)" }}> min</span></div><div className="sub">At 8 m/s ground speed</div></div>
+            <div className="metric-card"><div className="micro">Search duration</div><div className="value">{fmtNumber((plan.search.search_time_s ?? 0) / 60, 1)}<span style={{ fontSize: 13, color: "var(--muted)" }}> min</span></div><div className="sub">{speed !== undefined ? `At ${fmtNumber(speed, 1)} m/s ground speed` : "Speed not published by the plan"}</div></div>
             <div className="metric-card"><div className="micro">Mission estimate</div><div className="value">{plan.estimate?.total_min_low ?? "—"}–{plan.estimate?.total_min_high ?? "—"}<span style={{ fontSize: 13, color: "var(--muted)" }}> min</span></div><div className="sub">CALCULATED · includes delivery allowance</div></div>
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr) 300px", gap: 12 }}>
-            <TacticalMap aoi={aoi} plan={plan} vehicles={vehicles} />
+            <TacticalMap aoi={aoi} plan={plan} vehicles={vehicles} provenance={provenance} />
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               <Panel title="Geofences" icon={<ShieldCheck size={13} />}>
-                {Object.values(plan.geofences ?? {}).map((fence) => (
+                {fences.map((fence) => (
                   <div className="kv" key={fence.callsign}>
                     <span className="k mono">{fence.callsign}</span>
-                    <span className="v">{String(fence.type ?? "inclusion")}</span>
+                    <span className="v">
+                      {String(fence.type ?? "inclusion")}
+                      {typeof fence.max_alt_m === "number" ? ` · ${fmtNumber(fence.max_alt_m, 1)} m ceil` : ""}
+                    </span>
                   </div>
                 ))}
                 <div className="divider" />
-                <div className="small muted">RTL after search · 25 m for INS-01 · 2 m boundary inset</div>
+                <div className="small muted">
+                  {fences.length
+                    ? `${fences[0].action ?? "RTL"} after search · ${ceilings.length ? `ceiling ${fmtNumber(Math.max(...ceilings), 1)} m` : "ceiling not published"}${inset !== undefined ? ` · ${fmtNumber(inset, 1)} m lane inset` : ""}`
+                    : "No fences in this plan."}
+                </div>
               </Panel>
               <Panel title="Energy" icon={<Gauge size={13} />}>
                 {Object.entries(plan.energy ?? {}).slice(0, 4).map(([key, value]) => (
@@ -1036,7 +1108,12 @@ function LaunchStage({
             <div className="kv"><span className="k">Boundary</span><span className="v">{state.mission.aoi?.area_ha?.toFixed(2) ?? "—"} ha</span></div>
             <div className="kv"><span className="k">Lanes</span><span className="v mono">{state.mission.plan?.search.lane_count ?? "—"}</span></div>
             <div className="kv"><span className="k">Preflight</span><span className="v">{report?.ready ? "Ready" : "Incomplete"}</span></div>
-            <div className="kv"><span className="k">Evidence</span><span className="v mono">SIMULATED</span></div>
+            <div className="kv">
+              <span className="k">Evidence</span>
+              <span className="v">
+                <Badge tone={qualityTone(evidenceQuality(state))}>{evidenceQuality(state)}</Badge>
+              </span>
+            </div>
           </Panel>
           {executing ? (
             <button className="btn primary block" onClick={onMission}><PlaneTakeoff size={14} /> Open mission command</button>

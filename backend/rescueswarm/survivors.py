@@ -15,6 +15,14 @@ from .util import iso_now, new_id
 
 
 class SurvivorRegistry:
+    # The registry vocabulary, matched to the delivery engine's SURVIVOR_STATUS map and
+    # the operator badge union in desktop/src/lib/types.ts.
+    STATUSES = {"CONFIRMED", "ASSIGNED", "IN_DELIVERY", "DELIVERED", "UNKNOWN", "UNSERVED"}
+    # CONFIRMED is the only allocation-eligible state. UNSERVED is deliberately not
+    # terminal: the allocator retries automatically while the sortie runs.
+    LOCKED_STATUSES = STATUSES - {"CONFIRMED"}
+    MAX_UNCERTAINTY_M = 50.0
+
     def __init__(self, config: Config, db: Database, bus: EventBus) -> None:
         self.config = config
         self.db = db
@@ -55,18 +63,47 @@ class SurvivorRegistry:
             self._reject(aircraft, "Invalid coordinates in survivor report")
             return None
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-            self._reject(aircraft, "Survivor coordinates outside WGS84 bounds")
+            self._reject(aircraft, "Survivor coordinates outside WGS84 bounds", data_quality)
             return None
-        confidence = float(envelope.get("confidence_mean", envelope.get("confidence", 0.0)))
-        frames = int(envelope.get("frames_confirmed", 3))
-        uncertainty = float(envelope.get("geotag_uncertainty_m", 3.0))
+        try:
+            confidence = float(envelope.get("confidence_mean", envelope.get("confidence", 0.0)))
+            frames = int(envelope.get("frames_confirmed", 3))
+            uncertainty = float(envelope.get("geotag_uncertainty_m", 3.0))
+        except (TypeError, ValueError):
+            self._reject(aircraft, "Survivor report carries a non-numeric metric", data_quality)
+            return None
+        # NaN and ±inf survive a "<" comparison (every NaN test is False), so they must be
+        # refused explicitly or they poison the weighted merge and the stored evidence.
+        if not all(math.isfinite(value) for value in (confidence, uncertainty)) or frames < 0:
+            self._reject(aircraft, "Survivor report metric is not finite", data_quality)
+            return None
         if confidence < 0.85 or frames < 3:
-            self._reject(aircraft, f"Confirmation threshold not met (confidence={confidence:.2f}, frames={frames})")
+            self._reject(
+                aircraft,
+                f"Confirmation threshold not met (confidence={confidence:.2f}, frames={frames})",
+                data_quality,
+            )
             return None
-        if uncertainty <= 0 or uncertainty > 50:
-            uncertainty = 3.0
+        if uncertainty <= 0:
+            # A zero or negative radius is not a better fix than the worst one we accept;
+            # it is a malformed field, so report it as the cap and keep the warning visible.
+            self._reject(
+                aircraft,
+                f"Impausible geotag uncertainty {uncertainty} m; carried as "
+                f"{self.MAX_UNCERTAINTY_M:.0f} m",
+                data_quality,
+            )
+            uncertainty = self.MAX_UNCERTAINTY_M
+        elif uncertainty > self.MAX_UNCERTAINTY_M:
+            self._reject(
+                aircraft,
+                f"Impausible geotag uncertainty {uncertainty:.1f} m; carried as "
+                f"{self.MAX_UNCERTAINTY_M:.0f} m",
+                data_quality,
+            )
+            uncertainty = self.MAX_UNCERTAINTY_M
         if self.aoi and not point_inside_aoi(self.aoi, lat, lon):
-            self._reject(aircraft, "Survivor report lies outside the mission boundary")
+            self._reject(aircraft, "Survivor report lies outside the mission boundary", data_quality)
             return None
 
         merge_distance = float(self.config.get("mission", "merge_distance_m", default=5.0))
@@ -80,13 +117,17 @@ class SurvivorRegistry:
                     duplicate_distance = distance
             if duplicate:
                 total_weight = duplicate["confidence"] * duplicate["observations"] + confidence
-                if total_weight > 0:
-                    duplicate["lat"] = (
+                # A survivor that already has an aircraft committed to it must not drift:
+                # the delivery vehicle navigates to the geotag that was assigned, and a
+                # merge that moves it would silently re-aim a live drop.
+                position_locked = duplicate["status"] != "CONFIRMED"
+                if total_weight > 0 and not position_locked:
+                    duplicate["lat"] = round((
                         duplicate["lat"] * duplicate["confidence"] * duplicate["observations"] + lat * confidence
-                    ) / total_weight
-                    duplicate["lon"] = (
+                    ) / total_weight, 7)
+                    duplicate["lon"] = round((
                         duplicate["lon"] * duplicate["confidence"] * duplicate["observations"] + lon * confidence
-                    ) / total_weight
+                    ) / total_weight, 7)
                 duplicate["observations"] += 1
                 duplicate["confidence"] = max(duplicate["confidence"], confidence)
                 duplicate["uncertainty_m"] = round(
@@ -117,12 +158,26 @@ class SurvivorRegistry:
                         "survivor": self._public(duplicate),
                         "merged": True,
                         "merge_distance_m": round(duplicate_distance, 2),
+                        "geotag_locked": position_locked,
                         "source_aircraft": aircraft,
                     },
                     source=aircraft,
                     data_quality=data_quality,
                 )
                 return self._public(duplicate)
+
+            cap = int(self.config.get("mission", "max_survivors", default=10))
+            if len(self.survivors) >= cap:
+                # Every new survivor is a kit demand and a slot in the allocation loop.
+                # Without a bound a flooded detector would grow the registry past the
+                # magazine capacity and stall the operator's screen.
+                self._reject(
+                    aircraft,
+                    f"Survivor registry is at its configured capacity ({cap}); "
+                    f"detection not registered as a new survivor",
+                    data_quality,
+                )
+                return None
 
             survivor_id = f"S-{self._next_index:02d}"
             self._next_index += 1
@@ -182,13 +237,13 @@ class SurvivorRegistry:
             )
             return self._public(survivor)
 
-    def _reject(self, aircraft: str, reason: str) -> None:
+    def _reject(self, aircraft: str, reason: str, data_quality: str = "LIVE") -> None:
         self.bus.publish(
             "survivor.rejected",
             {"source_aircraft": aircraft, "reason": reason},
             severity="warning",
             source=aircraft,
-            data_quality="LIVE",
+            data_quality=data_quality,
         )
 
     def set_status(
@@ -201,9 +256,20 @@ class SurvivorRegistry:
         eta_s: float | None = None,
         note: str | None = None,
     ) -> dict[str, Any]:
+        if status not in self.STATUSES:
+            raise ValueError(f"Unknown survivor status {status!r}")
         with self._lock:
-            survivor = self.survivors[survivor_id]
+            survivor = self.survivors.get(survivor_id)
+            if survivor is None:
+                raise KeyError(f"Unknown survivor {survivor_id}")
             previous = survivor["status"]
+            if previous == "DELIVERED" and status != "UNKNOWN":
+                # A delivered case is durable beam evidence. A late or duplicated message
+                # must not turn it back into open demand and re-fire an allocation; only an
+                # explicit evidence reconciliation may downgrade it to UNKNOWN.
+                raise ValueError(
+                    f"Survivor {survivor_id} is DELIVERED; refusing to set it {status}"
+                )
             survivor["status"] = status
             if owner is not None:
                 survivor["owner"] = owner

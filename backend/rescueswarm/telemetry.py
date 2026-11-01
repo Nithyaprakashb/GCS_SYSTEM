@@ -37,6 +37,23 @@ MAV_CMD_DO_REPOSITION = 192
 MAV_CMD_DO_SET_SERVO = 183
 
 
+# Transaction states.
+#   CREATED -> SENT -> ACKNOWLEDGED -> VERIFIED        (command accepted AND vehicle
+#                                                       state reached the expected condition)
+#                     -> REJECTED / TIMEOUT            (command did not take effect)
+#                     -> ACK_UNVERIFIED                (autopilot accepted the command but the
+#                                                       expected physical state was not seen)
+# ACKNOWLEDGED is never treated as proof that the physical action finished.
+TERMINAL_TX_STATES = {"VERIFIED", "REJECTED", "TIMEOUT", "ACK_UNVERIFIED"}
+
+# ACKNOWLEDGED is deliberately NOT terminal: the sweep has to keep watching it so it can
+# become VERIFIED or ACK_UNVERIFIED. It is, however, a settling moment — the delivery engine
+# must react to the acceptance of a release command the instant the ACK arrives, because a
+# servo command has no vehicle-state proof available to the GCS. Conflating those two ideas
+# is what used to freeze every acknowledged command in a state it could never leave.
+SETTLING_TX_STATES = TERMINAL_TX_STATES | {"ACKNOWLEDGED"}
+
+
 @dataclass
 class CommandTransaction:
     tx_id: str
@@ -51,6 +68,16 @@ class CommandTransaction:
     ack_result: int | None = None
     detail: str = ""
     simulated: bool = False
+    # True only once a frame was actually written to a real MAVLink transport. This is what
+    # separates "the GCS never let the command out" from "the command went out and nothing
+    # came back", and therefore what separates a kit that is provably still in the magazine
+    # from one whose fate is unknown. Simulation leaves it False: no frame left the station.
+    transmitted: bool = False
+    expectation: dict[str, Any] | None = None
+    ack_at: str | None = None
+    verified_at: str | None = None
+    timeout_at: float | None = None
+    verify_deadline: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -65,6 +92,10 @@ class CommandTransaction:
             "ack_result": self.ack_result,
             "detail": self.detail,
             "simulated": self.simulated,
+            "transmitted": self.transmitted,
+            "expectation": self.expectation,
+            "ack_at": self.ack_at,
+            "verified_at": self.verified_at,
         }
 
 
@@ -82,6 +113,7 @@ class TelemetryManager:
         self.topology = config.get("telemetry", "topology", default="shared")
         self.topology_status = "UNVERIFIED"
         self._last_unexpected: dict[int, float] = {}
+        self._last_endpoint_mismatch: dict[str, float] = {}
         self._monitor_task: asyncio.Task | None = None
         self._persist_task: asyncio.Task | None = None
         self._last_persist: dict[str, float] = {}
@@ -89,6 +121,7 @@ class TelemetryManager:
         self._transactions: dict[str, CommandTransaction] = {}
         self._tx_timeout_task: asyncio.Task | None = None
         self.sim_command_handler: Callable[[str, int, list[float]], bool] | None = None
+        self.command_settled_handler: Callable[[str], None] | None = None
         self.project_event_handler: Callable[[str, dict[str, Any]], None] | None = None
         self.mission_message_handler: Callable[[str, Any], None] | None = None
         self.param_message_handler: Callable[[str, Any], None] | None = None
@@ -108,6 +141,7 @@ class TelemetryManager:
                 "identity_valid": False,
                 "identity_note": "No heartbeat received",
                 "mode": "—",
+                "custom_mode": None,
                 "armed": False,
                 "lat": None,
                 "lon": None,
@@ -155,12 +189,44 @@ class TelemetryManager:
         self._init_vehicles()
         self._transactions.clear()
 
+    def _abandon_pending_transactions(self, reason: str) -> None:
+        """No transaction may survive a link change unresolved.
+
+        An accepted command and an unanswered one must not collapse into the same label:
+        TIMEOUT on an ACK the vehicle really sent would tell the operator the command never
+        arrived, which is its own kind of false evidence.
+        """
+        for tx in list(self._transactions.values()):
+            if tx.state in TERMINAL_TX_STATES:
+                continue
+            if tx.ack_at:
+                tx.state = "ACK_UNVERIFIED"
+                tx.detail = f"{reason}; the acceptance was received but the physical result was never seen"
+            else:
+                tx.state = "TIMEOUT"
+                tx.detail = reason
+            tx.updated_at = iso_now()
+            tx.timeout_at = None
+            tx.verify_deadline = None
+            self._settle(tx, "command.abandoned", severity="warning")
+
+    def _reset_vehicle_records(self) -> None:
+        """Wipe cached telemetry so records seeded in one mode cannot survive into the other.
+
+        Without this, a simulated heartbeat leaves connected=True / identity_valid=True
+        behind after switching to REAL and the pre-launch freshness gate passes with zero
+        radio traffic.
+        """
+        self._init_vehicles()
+
     # ---------------------------------------------------------------- connect
     async def connect(self, mode: str) -> dict[str, Any]:
         mode = mode.upper()
         if mode not in {"SIMULATION", "REAL"}:
             raise ValueError("Mode must be SIMULATION or REAL")
         self.disconnect()
+        self._abandon_pending_transactions("Link mode changed before the vehicle answered")
+        self._init_vehicles()
         self.mode = mode
         if mode == "SIMULATION":
             self.connected = True
@@ -235,6 +301,14 @@ class TelemetryManager:
         if self.shared_transport:
             self.shared_transport.close()
             self.shared_transport = None
+        for state in self.vehicles.values():
+            state["connected"] = False
+            state["stale"] = True
+            state["link"] = "OFFLINE"
+            state["identity_valid"] = False
+            state["identity_note"] = "Link closed"
+            state["data_quality"] = "UNAVAILABLE"
+            state["source"] = "NONE"
         if self.connected:
             self.bus.publish("fleet.connection", {"connected": False},
                              source="TELEMETRY", data_quality="LIVE")
@@ -265,6 +339,28 @@ class TelemetryManager:
             msg_type = msg.get_type()
             sysid = int(getattr(msg, "get_srcSystem", lambda: 0)())
             callsign = self.config.sysid_map.get(sysid)
+            # Independent-topology commissioning check: a modem wired to one aircraft must
+            # not be the path for another one, or the operator believes they have two links
+            # while both commands actually reach the same vehicle.
+            if endpoint_callsign and callsign and callsign != endpoint_callsign:
+                now = time.monotonic()
+                if now - self._last_endpoint_mismatch.get(callsign, 0) > 10:
+                    self._last_endpoint_mismatch[callsign] = now
+                    self.bus.publish(
+                        "safety.interlock",
+                        {"rule_id": "ENDPOINT_MISMATCH", "callsign": callsign,
+                         "endpoint": endpoint_callsign, "sysid": sysid,
+                         "detail": f"SysID {sysid} ({callsign}) answered on the {endpoint_callsign} "
+                                   f"modem; independent-link wiring is wrong and this message was ignored"},
+                        severity="critical", source="TELEMETRY", data_quality="LIVE",
+                    )
+                return
+            # Deliberately no blanket "if endpoint_callsign: return" here. On an independent
+            # modem every message — heartbeat, position, COMMAND_ACK, mission and param
+            # replies — arrives with the endpoint's own vehicle as the source, and dropping
+            # all of it made independent topology silently dead: the aircraft answered, the
+            # GCS reported it offline and refused every command. The wiring interlock is the
+            # mismatch check above, not a filter on the whole transport.
             if msg_type == "HEARTBEAT":
                 self._on_heartbeat(sysid, callsign, msg)
                 return
@@ -369,6 +465,7 @@ class TelemetryManager:
                 stale=False,
                 armed=is_armed,
                 mode=mode,
+                custom_mode=int(msg.custom_mode),
                 source="MAVLINK",
                 data_quality="LIVE",
                 identity_valid=autopilot_ok and type_ok,
@@ -399,14 +496,103 @@ class TelemetryManager:
                              severity="warning", source=callsign, data_quality="LIVE")
 
     # ----------------------------------------------------------------- commands
+    def _settle(self, tx: CommandTransaction, kind: str, *, severity: str = "info") -> None:
+        quality = "SIMULATED" if tx.simulated else "LIVE"
+        self.bus.publish(kind, {"tx": tx.to_dict()}, severity=severity,
+                         source=tx.callsign if self.mode == "REAL" else "GCS",
+                         data_quality=quality)
+        if tx.state in SETTLING_TX_STATES and self.command_settled_handler:
+            try:
+                self.command_settled_handler(tx.tx_id)
+            except Exception as exc:
+                self.bus.publish(
+                    "system.error",
+                    {"detail": f"Command settle handler failed for {tx.tx_id}: {exc}"},
+                    severity="critical", source="GCS", data_quality=quality,
+                )
+
+    def _expectation_for(self, command: int, params: list[float]) -> dict[str, Any] | None:
+        """What the vehicle state must show before an accepted command can be called done."""
+        def p(index: int) -> float:
+            return float(params[index]) if len(params) > index else 0.0
+
+        if command == MAV_CMD_DO_SET_MODE:
+            return {"kind": "mode", "value": int(p(1)), "describe": f"custom mode {int(p(1))}"}
+        if command == MAV_CMD_COMPONENT_ARM_DISARM:
+            want = bool(p(0))
+            return {"kind": "armed" if want else "disarmed",
+                    "describe": "armed heartbeat" if want else "disarmed heartbeat"}
+        if command == MAV_CMD_NAV_TAKEOFF:
+            return {"kind": "altitude_above_m", "value": max(1.0, p(6) * 0.8),
+                    "describe": f"relative altitude above {max(1.0, p(6) * 0.8):.1f} m"}
+        if command == MAV_CMD_NAV_LAND:
+            return {"kind": "altitude_below_m", "value": 1.0, "describe": "relative altitude below 1 m"}
+        if command == MAV_CMD_NAV_RETURN_TO_LAUNCH:
+            return {"kind": "mode_in", "value": [6, 21, 7], "describe": "RTL / SMART_RTL / CIRCLE mode"}
+        if command == MAV_CMD_DO_REPOSITION:
+            return {"kind": "mode_in", "value": [4, 16, 5, 17], "describe": "GUIDED / POSHOLD / LOITER / BRAKE mode"}
+        return None
+
+    def _expectation_met(self, tx: CommandTransaction) -> bool:
+        exp = tx.expectation
+        if not exp:
+            return False
+        state = self.vehicles.get(tx.callsign)
+        if not state:
+            return False
+        kind = exp.get("kind")
+        custom_mode = state.get("custom_mode")
+        if kind == "mode":
+            return custom_mode is not None and int(custom_mode) == int(exp["value"])
+        if kind == "mode_in":
+            return custom_mode is not None and int(custom_mode) in {int(v) for v in exp["value"]}
+        if kind == "armed":
+            return bool(state.get("armed"))
+        if kind == "disarmed":
+            return custom_mode is not None and not state.get("armed")
+        alt = state.get("alt_rel_m")
+        if kind == "altitude_above_m":
+            return alt is not None and float(alt) >= float(exp["value"])
+        if kind == "altitude_below_m":
+            return alt is not None and float(alt) <= float(exp["value"])
+        return False
+
+    def _mark_verified(self, tx: CommandTransaction) -> None:
+        tx.state = "VERIFIED"
+        tx.verified_at = iso_now()
+        tx.updated_at = iso_now()
+        tx.timeout_at = None
+        tx.verify_deadline = None
+        tx.detail = "Vehicle state confirms the command"
+        self._settle(tx, "command.verified")
+
     def simulate_ack(self, tx_id: str) -> None:
         tx = self._transactions.get(tx_id)
         if not tx:
             return
         tx.state = "ACKNOWLEDGED"
         tx.ack_result = 0
+        tx.ack_at = iso_now()
         tx.updated_at = iso_now()
-        self.bus.publish("command.ack", {"tx": tx.to_dict()}, source="GCS", data_quality="SIMULATED")
+        tx.timeout_at = None
+        tx.verify_deadline = None
+        tx.detail = "ACCEPTED (simulated vehicle; simulated acceptance is not flight evidence)"
+        self._settle(tx, "command.ack")
+
+    def _address_block(self, callsign: str, state: dict[str, Any],
+                       transport: MavlinkTransport | None) -> str:
+        """REAL-mode gate: never address a vehicle the GCS cannot currently see."""
+        if not transport:
+            return "No MAVLink transport is open for this vehicle"
+        if state.get("source") != "MAVLINK":
+            return f"No MAVLink traffic received from {callsign} on this link (source={state.get('source')})"
+        if not state.get("identity_valid"):
+            return f"Vehicle identity is not verified: {state.get('identity_note') or 'no heartbeat'}"
+        if not state.get("connected"):
+            return "Vehicle link is down"
+        if state.get("stale"):
+            return f"Telemetry is stale (last heartbeat {state.get('heartbeat_age_s')} s ago)"
+        return ""
 
     def send_command(
         self,
@@ -421,14 +607,18 @@ class TelemetryManager:
         tx = CommandTransaction(
             tx_id=new_id("TX"),
             callsign=callsign,
-            command=command,
+            command=int(command),
             label=label,
             params=params,
             simulated=self.mode == "SIMULATION",
         )
+        if self.mode == "REAL":
+            tx.expectation = self._expectation_for(int(command), list(params))
         self._transactions[tx.tx_id] = tx
         tx.state = "SENT"
         tx.attempts = 1
+        timeout_s = float(self.config.get("telemetry", "command_timeout_s", default=2.5))
+        tx.timeout_at = time.monotonic() + timeout_s
         self.bus.publish("command.sent", {"tx": tx.to_dict(), "params": params},
                          source="GCS", data_quality=state.get("data_quality", "UNKNOWN"))
         if self.mode == "SIMULATION":
@@ -443,49 +633,109 @@ class TelemetryManager:
             else:
                 tx.state = "REJECTED"
                 tx.detail = "Simulation rejected command"
+                tx.timeout_at = None
+                self._settle(tx, "command.rejected", severity="warning")
         else:
             transport = self.transports.get(callsign) or self.shared_transport
-            if not transport:
+            block_reason = self._address_block(callsign, state, transport)
+            if block_reason:
                 tx.state = "REJECTED"
-                tx.detail = "No transport for vehicle"
+                tx.detail = f"NOT_ADDRESSED — {block_reason}"
+                tx.timeout_at = None
+                self._settle(tx, "command.rejected", severity="critical")
+                self.bus.publish(
+                    "safety.interlock",
+                    {"rule_id": "COMMAND_NOT_ADDRESSED", "callsign": callsign,
+                     "command": int(command), "detail": block_reason},
+                    severity="critical", source="TELEMETRY", data_quality="LIVE",
+                )
             else:
                 try:
                     transport.command_long(
                         int(state["sysid"]), 1, command, params, confirmation=confirmation
                     )
+                    # Only after the write returned: this is the line the payload ledger uses
+                    # to decide whether a kit's fate is unknown or still aboard.
+                    tx.transmitted = True
+                    if tx.expectation:
+                        tx.verify_deadline = (
+                            time.monotonic() + timeout_s
+                            + float(self.config.get("telemetry", "state_verify_s", default=8.0))
+                        )
                 except Exception as exc:
                     tx.state = "REJECTED"
                     tx.detail = str(exc)
-        self._transactions[tx.tx_id] = tx
-        self._schedule_tx_timeout(tx.tx_id)
+                    tx.timeout_at = None
+                    self._settle(tx, "command.rejected", severity="warning")
+        if len(self._transactions) > 500:
+            for stale_id, stale_tx in list(self._transactions.items())[:-200]:
+                if stale_tx.state in TERMINAL_TX_STATES:
+                    del self._transactions[stale_id]
         return tx
 
-    def _schedule_tx_timeout(self, tx_id: str) -> None:
-        async def waiter() -> None:
-            await asyncio.sleep(float(self.config.get("telemetry", "command_timeout_s", default=2.5)))
-            tx = self._transactions.get(tx_id)
-            if tx and tx.state in {"SENT", "RETRYING"}:
-                tx.state = "TIMEOUT"
-                tx.detail = "No COMMAND_ACK before timeout"
-                self.bus.publish("command.timeout", {"tx": tx.to_dict()},
-                                 severity="warning", source="GCS",
-                                 data_quality="SIMULATED" if self.mode == "SIMULATION" else "LIVE")
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(waiter())
-        except RuntimeError:
-            pass
+    def _sweep_transactions(self, now: float) -> None:
+        """Time out unanswered commands and resolve state verification.
+
+        Driven from the monitor loop rather than ad-hoc asyncio tasks: commands can be
+        issued from the MAVLink reader thread, where there is no running loop, and bare
+        tasks without a strong reference can be garbage-collected before they fire.
+        """
+        for tx in list(self._transactions.values()):
+            if tx.state in TERMINAL_TX_STATES:
+                continue
+            if tx.state in {"SENT", "RETRYING"}:
+                if tx.timeout_at and now >= tx.timeout_at:
+                    tx.state = "TIMEOUT"
+                    tx.detail = f"No COMMAND_ACK within {self.config.get('telemetry', 'command_timeout_s', default=2.5)} s"
+                    tx.timeout_at = None
+                    tx.verify_deadline = None
+                    self._settle(tx, "command.timeout", severity="warning")
+                continue
+            if tx.state == "ACKNOWLEDGED":
+                if not tx.expectation:
+                    continue
+                if self._expectation_met(tx):
+                    self._mark_verified(tx)
+                elif tx.verify_deadline and now >= tx.verify_deadline:
+                    tx.state = "ACK_UNVERIFIED"
+                    tx.detail = (
+                        f"Autopilot accepted the command but the vehicle never showed "
+                        f"{tx.expectation.get('describe')}; the physical action is NOT confirmed"
+                    )
+                    tx.verify_deadline = None
+                    self._settle(tx, "command.unverified", severity="critical")
 
     def _on_command_ack(self, callsign: str, msg: Any) -> None:
+        src_component = int(getattr(msg, "get_srcComponent", lambda: 1)())
+        if src_component != 1:
+            # Only the autopilot component can accept a flight command. A camera, gimbal or
+            # companion computer ACK is not evidence that the vehicle took the command.
+            return
         for tx in reversed(list(self._transactions.values())):
-            if tx.callsign == callsign and tx.command == msg.command and tx.state in {"SENT", "RETRYING"}:
+            if tx.callsign == callsign and tx.command == int(msg.command) and tx.state in {"SENT", "RETRYING"}:
                 tx.ack_result = int(msg.result)
                 tx.updated_at = iso_now()
-                tx.state = "ACKNOWLEDGED" if msg.result == 0 else "REJECTED"
-                tx.detail = "ACCEPTED" if msg.result == 0 else f"MAV_RESULT {msg.result}"
-                self.bus.publish("command.ack", {"tx": tx.to_dict()},
-                                 source=callsign, data_quality="LIVE")
+                tx.ack_at = iso_now()
+                tx.timeout_at = None
+                if int(msg.result) == 0:
+                    tx.state = "ACKNOWLEDGED"
+                    tx.detail = (
+                        "ACCEPTED — awaiting vehicle state verification"
+                        if tx.expectation else "ACCEPTED (this command has no vehicle-state check)"
+                    )
+                    self._settle(tx, "command.ack")
+                    if tx.expectation and self._expectation_met(tx):
+                        self._mark_verified(tx)
+                else:
+                    tx.state = "REJECTED"
+                    tx.detail = f"MAV_RESULT {msg.result}"
+                    tx.verify_deadline = None
+                    self._settle(tx, "command.ack", severity="warning")
                 return
+
+    def transaction(self, tx_id: str) -> dict[str, Any] | None:
+        tx = self._transactions.get(tx_id)
+        return tx.to_dict() if tx else None
 
     def transactions(self) -> list[dict[str, Any]]:
         return [tx.to_dict() for tx in list(self._transactions.values())[-100:]]
@@ -504,8 +754,20 @@ class TelemetryManager:
             await asyncio.sleep(0.25)
             now = time.monotonic()
             changed = []
+            self._sweep_transactions(now)
             for callsign, state in self.vehicles.items():
                 if self.mode != "SIMULATION" and state["source"] != "MAVLINK":
+                    # REAL mode: a record that never carried MAVLink traffic (left over from
+                    # a simulation, or a vehicle that has simply not answered yet) is LOST,
+                    # not "quietly skipped" while still reporting connected=True.
+                    if state["connected"] or not state["stale"]:
+                        state["connected"] = False
+                        state["stale"] = True
+                        state["link"] = "LOST"
+                        state["data_quality"] = "LOST"
+                        state["identity_valid"] = False
+                        state["identity_note"] = "No MAVLink source on this link in REAL mode"
+                        changed.append(callsign)
                     continue
                 age = now - float(state.get("last_seen_mono") or 0)
                 state["heartbeat_age_s"] = round(age, 2)
@@ -561,6 +823,11 @@ class TelemetryManager:
                 "connected": self.connected,
                 "topology": self.topology,
                 "topology_status": self.topology_status,
+                # The physical commissioning record, not the configured intent: without it
+                # "topology: shared" could read on screen as though the link were proven.
+                "topology_commissioned": bool(
+                    self.config.get("telemetry", "topology_verified", default=False)
+                ),
                 "vehicles": [dict(v) for v in self.vehicles.values()],
                 "transactions": self.transactions(),
             }
@@ -569,6 +836,28 @@ class TelemetryManager:
         return self.vehicles[callsign]
 
     def all_fresh(self) -> bool:
-        return all(
-            v["connected"] and not v["stale"] and v["identity_valid"] for v in self.vehicles.values()
-        )
+        for v in self.vehicles.values():
+            if not (v["connected"] and not v["stale"] and v["identity_valid"]):
+                return False
+            # In REAL mode only live MAVLink may satisfy the gate; simulated or stale rows
+            # must never let a launch proceed on cached data.
+            if self.mode == "REAL" and (v["source"] != "MAVLINK" or v["data_quality"] != "LIVE"):
+                return False
+        return True
+
+    def freshness_report(self) -> dict[str, str]:
+        """Per-vehicle reason for failing the gate, for the preflight panel."""
+        report: dict[str, str] = {}
+        for callsign, v in self.vehicles.items():
+            reasons = []
+            if not v["connected"]:
+                reasons.append("link down")
+            if v["stale"]:
+                reasons.append(f"telemetry stale ({v.get('heartbeat_age_s')} s)")
+            if not v["identity_valid"]:
+                reasons.append(v.get("identity_note") or "identity unverified")
+            if self.mode == "REAL" and v["source"] != "MAVLINK":
+                reasons.append(f"no MAVLink source (cached as {v['source']})")
+            if reasons:
+                report[callsign] = "; ".join(reasons)
+        return report

@@ -81,7 +81,7 @@ readiness. Heartbeats from unknown system IDs never create a vehicle entry.
 | `DISTANCE_SENSOR` | `distance` | rangefinder / AGL (TFmini-S on delivery aircraft) |
 | `RADIO_STATUS` | `rssi` | link quality percentage (capped 0–100) |
 | `MISSION_CURRENT` | `seq` | active waypoint index |
-| `STATUSTEXT` | `severity`, `text` | human-readable autopilot message |
+| `STATUSTEXT` | `severity`, `text` | raw autopilot text, preserved verbatim with `severity_raw`; reaches the event log, not the vehicle card (`FR-014`) |
 | `COMMAND_ACK` | `command`, `result` | command transaction resolution |
 | `TUNNEL` | JSON payload | project events from the companion computer |
 
@@ -189,14 +189,29 @@ compared:
 | Parameter | Value | Reason |
 |---|---|---|
 | `FENCE_ENABLE` | 1 | enable geofence |
-| `FENCE_TYPE` | 7 | altitude + circle + polygon |
+| `FENCE_TYPE` | **5** — altitude (1) + inclusion polygon (4) | circle/map (bit 2) is **deliberately not enabled** |
 | `FENCE_ACTION` | 1 | RTL on breach |
-| `FENCE_ALT_MAX` | plan max altitude | ceiling |
+| `FENCE_ALT_MAX` | plan `geofences[callsign].max_alt_m` | ceiling |
 | `RTL_ALT` | profile RTL altitude × 100 (cm) | consistent return height |
 | `FS_THR_ENABLE` | 1 | keep throttle failsafe enabled |
 | `BATT_FS_LOW_ACT` | 2 | low battery action |
 | `BATT_FS_CRT_ACT` | 1 | critical battery action |
-| `WPNAV_SPEED` | search or delivery speed × 100 (cm/s) | planned speed |
+| `WPNAV_SPEED` | search or delivery speed × 100 (cm/s) | planned speed; the key differs by role |
+
+`FENCE_TYPE` is a bitmask, and the plan authors a polygon and a ceiling but **no circle
+radius**. Enabling bit 2 would arm a breach monitor whose trigger distance is whatever
+`FENCE_RADIUS` happens to hold on that airframe — a fence the operator did not plan. So circle
+protection stays off until the plan carries a radius and it is proven on hardware. Guarded by
+`test_fence_circle_is_never_enabled_without_a_radius`. `SIMULATED`, `PENDING TEST` on hardware.
+
+**Parameters the station does not write, and why:**
+
+| Parameter | Status |
+|---|---|
+| `FS_GCS_ENABLE` | **Not written.** The station transmits no `HEARTBEAT`, so enabling the GCS comm-loss failsafe would put the aircraft in RTL/land on a link the autopilot believes is dead. Sequence: heartbeat sender first, then this parameter, then a read-back gate in preflight. Finding `H-6` / `A-2`, requirement `FR-016`, fix row `27a` |
+| `SYSID_MYGCS` | Not written — same reason; it names the GCS the failsafe watches |
+| `FS_EKF_ACTION`, `FS_EKF_THRESH` | Not written — behaviour on an EKF failure is the airframe's configured default, and choosing it without bench data would be inventing hardware behaviour |
+| `BATT_LOW_VOLT`, `BATT_CRT_VOLT` | Not written — voltage thresholds belong to a specific pack that has never been measured here. The GCS writes the *actions*, not the trigger levels |
 
 Parameters are written with `PARAM_SET` and verified with `PARAM_REQUEST_READ` /
 `PARAM_VALUE`, with a 1 % or 1e-3 tolerance. Failsafes are **enabled**, never
@@ -209,13 +224,23 @@ GCS crash leaves every onboard protection active.
 
 - Onboard ArduPilot failsafes remain authoritative. The GCS never sets
   `FS_THR_ENABLE = 0` or equivalent.
+- **The GCS does not transmit a `HEARTBEAT`.** It parses inbound heartbeats for presence,
+  age and mode, and answers vehicle requests, but as a MAVLink component it is silent.
+  A station that goes missing is therefore invisible to `FS_GCS_ENABLE`, which is exactly why
+  that parameter is left at 0 (see §6). This is the single most consequential gap in the
+  communication layer: `FR-016`, finding `A-2`/`H-6`, fix row `27a`.
 - If telemetry is lost, the GCS marks the link lost and raises an interlock; it
-  does not attempt to "recover" by sending blind commands.
+  does not attempt to "recover" by sending blind commands. Commands are single-shot —
+  `attempts` stays 1 and there is no `RETRYING` state — so a recall packet lost on the
+  radio is not re-sent. Deliberate for payload release, unresolved for recall
+  (`H-7`, fix row `27b`).
 - If the GCS process dies, vehicles continue under their uploaded mission and
   onboard failsafes. Nothing in the GCS is required to keep the aircraft safe.
 - Emergency recall is an operator action that commands LOITER/RTL/land through
   acknowledged transactions; it is not a substitute for onboard failsafes.
-- `STATUSTEXT` messages are surfaced, not parsed into control decisions.
+- `STATUSTEXT` is preserved verbatim with its raw severity and published to the event
+  stream; it is **not** parsed into control decisions, and it is not yet rendered on the
+  aircraft it came from (`FR-014`, fix row `42`).
 
 ---
 

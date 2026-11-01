@@ -65,18 +65,45 @@ class AppState:
         self.system = SystemService(self.config, self.db, self.evidence, self.video)
         self.telemetry.project_event_handler = self._on_project_event
         self.telemetry.sim_command_handler = self._on_sim_command
+        self.telemetry.command_settled_handler = self._on_command_settled
         self.started_at = iso_now()
+        self._shutdown_done = False
 
     # --------------------------------------------------------------- lifecycle
     async def startup(self) -> None:
         self.bus.bind_loop(asyncio.get_running_loop())
+        self.bus.start_persistence()
         await self.telemetry.start_monitors()
 
-    async def shutdown(self) -> None:
+    async def shutdown(self) -> dict[str, Any]:
+        """Close every child service this process owns. Calling it twice is harmless.
+
+        Order matters: the simulator and the capture/recorder children are stopped
+        before the event writer and the database, so nothing can queue work against a
+        closed handle. Onboard autopilot protections are parameters on the aircraft;
+        stopping the ground station cannot and does not touch them.
+        """
+        if self._shutdown_done:
+            return {"already_stopped": True}
         self.simulation.stop()
-        self.video.stop()
+        video = self.video.stop()
         self.telemetry.disconnect()
+        # Drain queued evidence before the database closes, then stop the writer.
+        drained = self.bus.flush_pending(2.0)
+        stats = self.bus.persistence_stats()
+        self.bus.stop_persistence(2.0)
         self.db.close()
+        self._shutdown_done = True
+        return {
+            "already_stopped": False,
+            "capture_processes_closed": video.get("capture_processes", 0),
+            "recorders_closed": video.get("recorders_closed", 0),
+            "capture_threads_joined": video.get("threads_joined", 0),
+            "event_queue_drained": drained,
+            "events_written": stats.get("written", 0),
+            "event_write_errors": stats.get("errors", 0),
+            "onboard_parameters_touched": 0,
+        }
 
     # ------------------------------------------------------------------- modes
     async def set_mode(self, mode: str, operator: str = "operator") -> dict[str, Any]:
@@ -127,6 +154,22 @@ class AppState:
     def _on_sim_command(self, callsign: str, command: int, params: list[float]) -> bool:
         # The simulator accepts commands so the transaction/ACK path is exercised.
         return True
+
+    def _on_command_settled(self, tx_id: str) -> None:
+        """Feed a terminal command transaction into the delivery state machine.
+
+        This runs on the MAVLink reader thread in REAL mode, so it must stay short
+        and must never raise into the link loop.
+        """
+        try:
+            self.delivery.settle_release_transaction(tx_id)
+        except Exception as exc:
+            self.bus.publish(
+                "system.error",
+                {"detail": f"Release settlement failed for {tx_id}: {exc}"},
+                severity="critical", source="GCS",
+                data_quality="SIMULATED" if self.telemetry.mode == "SIMULATION" else "LIVE",
+            )
 
     # ------------------------------------------------------------------- views
     def ui_snapshot(self) -> dict[str, Any]:

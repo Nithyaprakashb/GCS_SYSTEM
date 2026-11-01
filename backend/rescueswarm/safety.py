@@ -57,6 +57,11 @@ class SafetyEngine:
             })
 
         kit_ok, kit_reason = self.ledger.release_allowed(kit_id, survivor_id)
+        # A commanded recall outranks every pending delivery. Once the operator has ordered
+        # the fleet home, no servo frame may leave the station — not even for a task that is
+        # already sitting at hover with a kit reserved.
+        add("recall_active", not self.recall_active, self.recall_active, False,
+            "Emergency recall is active: payload release is blocked while the fleet is returning")
         add("kit_reservation", kit_ok, kit_id, "RESERVED for survivor", kit_reason or "Kit reserved")
 
         fresh = bool(state.get("connected")) and not state.get("stale") and state.get("identity_valid")

@@ -20,7 +20,7 @@ from .delivery import DeliveryEngine
 from .events import EventBus
 from .evidence import EvidenceStore
 from .kml import KmlError, parse_kml
-from .ledger import KitLedger
+from .ledger import KitLedger, LedgerError
 from .planner import PlanningError, generate_plan
 from .preflight import PreflightEngine
 from .safety import SafetyEngine
@@ -312,8 +312,13 @@ class MissionEngine:
             self.plan["plan_id"] if self.plan else "No plan")
         add("upload", "Upload and read-back verified", self._upload_verified(),
             "All aircraft receipts VERIFIED" if self._upload_verified() else "Upload not verified")
+        fresh = self.telemetry.freshness_report()
+        total_aircraft = len(self.config.callsigns)
         add("telemetry", "Fleet telemetry fresh and identified", self.telemetry.all_fresh(),
-            f"{sum(1 for v in self.telemetry.vehicles.values() if v['connected'])}/3 connected")
+            "All aircraft links live and identified" if not fresh else
+            "; ".join(f"{callsign}: {why}" for callsign, why in fresh.items())
+            if len(fresh) <= total_aircraft else f"{len(fresh)} links not fresh",
+        )
         add("mode", "Telemetry mode matches mission mode",
             self.telemetry.mode == self.mode and self.telemetry.connected,
             f"telemetry={self.telemetry.mode}, mission={self.mode}")
@@ -481,6 +486,11 @@ class MissionEngine:
                              source=aircraft, data_quality="LIVE")
 
     def handle_beam_event(self, envelope: dict[str, Any], data_quality: str = "SIMULATED") -> dict[str, Any]:
+        """Turn a break-beam report into delivery evidence.
+
+        An event with no id cannot be attributed to anything and is refused: silent
+        evidence is how a kit gets marked delivered that never left the aircraft.
+        """
         assignment_id = envelope.get("assignment_id")
         kit_id = envelope.get("kit_id")
         if not assignment_id and kit_id:
@@ -490,11 +500,29 @@ class MissionEngine:
                 assignment_id = assignment["assignment_id"] if assignment else None
         if not assignment_id:
             return {"accepted": False, "reason": "No matching assignment"}
+        event_id = envelope.get("event_id") or envelope.get("id")
+        if not event_id:
+            self.bus.publish(
+                "payload.denied",
+                {"assignment_id": assignment_id, "kit_id": kit_id,
+                 "reasons": ["Break-beam event carries no event id; unattributable evidence is refused"],
+                 "raw": {k: v for k, v in envelope.items() if k in {"beam_result", "result", "seq"}}},
+                severity="critical", source="SAFETY", data_quality=data_quality,
+            )
+            return {"accepted": False, "reason": "Break-beam event has no event id"}
         beam = str(envelope.get("beam_result") or envelope.get("result") or "UNKNOWN").upper()
         if beam not in {"CONFIRMED", "NO_BEAM", "SENSOR_FAULT", "UNKNOWN"}:
             beam = "UNKNOWN"
-        result = self.delivery.apply_beam_result(assignment_id, beam,
-                                                 event_id=envelope.get("event_id"))
+        try:
+            result = self.delivery.apply_beam_result(assignment_id, beam,
+                                                     event_id=str(event_id))
+        except LedgerError as exc:
+            self.bus.publish(
+                "payload.denied",
+                {"assignment_id": assignment_id, "kit_id": kit_id, "reasons": [str(exc)]},
+                severity="critical", source="LEDGER", data_quality=data_quality,
+            )
+            return {"accepted": False, "reason": str(exc)}
         self.bus.publish(
             "payload.verified",
             {"assignment_id": assignment_id, "beam_result": beam, "result": result},
@@ -536,24 +564,111 @@ class MissionEngine:
             for callsign in self.config.callsigns:
                 self.telemetry.send_command(callsign, MAV_CMD_DO_SET_MODE, [1, 5, 0, 0, 0, 0, 0],
                                             f"Abort — hold LOITER on {callsign}")
-        for assignment in list(self.allocator.assignments.values()):
-            if self.delivery.get(assignment["assignment_id"]):
-                state = self.delivery.get(assignment["assignment_id"])["state"]
-                if state in {"QUEUED", "LAUNCHING", "TRANSIT", "HOLD_CLEARANCE", "DESCENT", "HOVER_VERIFY"}:
-                    try:
-                        self.delivery.transition(assignment["assignment_id"], "ABORTED", detail=reason)
-                        self.delivery.transition(assignment["assignment_id"], "RETURNING",
-                                                 detail="Abort recovery")
-                    except ValueError:
-                        pass
+        returned, unknown = self._reconcile_kits_on_abort(reason)
         self.db.record_operator_action(self.mission_id, "MISSION_ABORT", operator, None, reason)
-        self.finalize("ABORTED", reason=reason)
+        status = self.finalize("ABORTED", reason=reason)
+        status = dict(status)
+        status.update({
+            "kits_returned_to_magazine": returned,
+            "kits_unverified": unknown,
+            "note": "Abort holds the fleet in LOITER. Kits without beam evidence are UNKNOWN "
+                    "and are never re-released automatically.",
+        })
+        return status
+
+    def _reconcile_kits_on_abort(self, reason: str) -> tuple[list[str], list[str]]:
+        """Leave no kit reserved or half-released when a sortie is aborted.
+
+        A kit whose release was never commanded is still physically aboard, so it goes
+        back to the pool and its survivor becomes unserved again. A kit that was commanded
+        away without beam evidence is UNKNOWN for good: aborting creates no evidence and
+        must not re-fire the latch.
+        """
+        returned: list[str] = []
+        unknown: list[str] = []
+        for assignment in list(self.allocator.assignments.values()):
+            task = self.delivery.get(assignment["assignment_id"])
+            if not task:
+                continue
+            state = task["state"]
+            if state in {"QUEUED", "LAUNCHING", "HOLD_CLEARANCE", "TRANSIT", "DESCENT", "HOVER_VERIFY"}:
+                try:
+                    self.delivery.transition(assignment["assignment_id"], "ABORTED", detail=reason)
+                    self.delivery.transition(assignment["assignment_id"], "RETURNING",
+                                             detail="Abort recovery")
+                except ValueError:
+                    pass
+                continue
+            if state not in {"ACK_PENDING", "RELEASE_SENT"}:
+                continue
+            kit = self.ledger.kits.get(task["kit_id"])
+            if not kit:
+                continue
+            tx = self.telemetry.transaction(task["pending_tx_id"]) if task.get("pending_tx_id") else None
+            if kit["load_status"] == "RESERVED" and tx and tx.get("transmitted"):
+                # The servo frame had already left the station when the abort landed. Whether
+                # the latch fired is unknown, and "unknown" must never be recycled into
+                # "still aboard" — that is how one physical kit gets promised to two people.
+                self.ledger.note_command_abandoned(
+                    task["kit_id"], reason=f"Abort during {state}: release frame already transmitted")
+                unknown.append(task["kit_id"])
+                try:
+                    self.delivery.transition(assignment["assignment_id"], "UNKNOWN",
+                                             detail=f"Abort during {state}: release frame transmitted, "
+                                                    "no beam evidence",
+                                             beam_result="NO_EVIDENCE")
+                except ValueError:
+                    pass
+                continue
+            if kit["load_status"] == "RESERVED":
+                self.ledger.cancel_reservation(task["kit_id"], reason=f"Abort during {state}")
+                returned.append(task["kit_id"])
+                try:
+                    self.delivery.transition(assignment["assignment_id"], "ABORTED",
+                                             detail=f"Abort during {state}")
+                except ValueError:
+                    pass
+            elif kit["load_status"] == "RELEASE_SENT":
+                self.ledger.note_command_abandoned(
+                    task["kit_id"], reason=f"Abort during {state} with no beam evidence")
+                unknown.append(task["kit_id"])
+                try:
+                    self.delivery.transition(assignment["assignment_id"], "UNKNOWN",
+                                             detail=f"Abort during {state}: no beam evidence",
+                                             beam_result="NO_EVIDENCE")
+                except ValueError:
+                    pass
+        for kit in list(self.ledger.kits.values()):
+            if kit["load_status"] == "RESERVED":
+                self.ledger.cancel_reservation(kit["kit_id"],
+                                               reason="Abort with no active delivery task")
+                returned.append(kit["kit_id"])
+        return returned, unknown
 
     def clear_recall(self, operator: str = "operator") -> dict[str, Any]:
+        """Clear the GCS recall flag.
+
+        In SIMULATION the simulator resumes its own state machine. In REAL mode this
+        only clears the ground-side latch: aircraft already in RTL stay in RTL, and the
+        GCS has no authority over onboard failsafes by design.
+        """
         self.recall = False
         self.safety.set_recall(False)
+        simulator_resumed = False
+        if self.simulation and self.mode == "SIMULATION" and self.simulation.running:
+            self.simulation.clear_recall()
+            simulator_resumed = True
+        else:
+            self.bus.publish(
+                "safety.interlock",
+                {"rule_id": "RECALL_CLEAR_REAL",
+                 "detail": "Ground recall flag cleared. Aircraft already in RTL remain in RTL; "
+                           "onboard failsafes are not under GCS control."},
+                severity="warning", source="SAFETY", data_quality="LIVE",
+            )
         self.db.record_operator_action(self.mission_id, "RECALL_CLEAR", operator, None, "")
-        return {"recall": False}
+        return {"recall": False, "simulator_resumed": simulator_resumed,
+                "note": "Aircraft autonomy is never overridden from the ground."}
 
     # -------------------------------------------------------------- lifecycle
     def finalize(self, outcome: str, **detail: Any) -> dict[str, Any]:
@@ -646,6 +761,18 @@ class MissionEngine:
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "elapsed_s": round(self.elapsed_s(), 1),
+            # The cap the engine actually enforces. The console used to print a hardcoded
+            # "cap 30:00", which would have been a lie the moment the profile changed.
+            "time_cap_min": float(self.config.get("mission", "time_cap_min", default=30.0)),
+            # The same numbers the safety and survivor rules actually read, published so the
+            # console can stop hard-coding them. A screen that prints "20 m" while the profile
+            # says otherwise is a briefing lie about a safety limit.
+            "limits": {
+                "descent_clearance_m": float(self.config.get("mission", "descent_clearance_m", default=20.0)),
+                "merge_distance_m": float(self.config.get("mission", "merge_distance_m", default=5.0)),
+                "proximity_warn_m": float(self.config.get("mission", "proximity_warn_m", default=8.0)),
+                "max_survivors": int(self.config.get("mission", "max_survivors", default=10)),
+            },
             "recall": self.recall,
             "aoi": self.aoi,
             "plan": plan_summary if include_plan else None,

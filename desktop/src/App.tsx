@@ -47,12 +47,13 @@ const TITLES: Record<Screen, { title: string; sub: string }> = {
 };
 
 export function App() {
-  const { state, connected, loading, error, theme, setTheme, run, busy, refresh, toasts, dismissToast } = useGcs();
+  const { state, connected, loading, error, theme, setTheme, run, notify, refresh, toasts, dismissToast } = useGcs();
   const [booted, setBooted] = useState(false);
   const [screen, setScreen] = useState<Screen>("setup");
   const [replayMission, setReplayMission] = useState<string | null>(null);
   const [confirmKind, setConfirmKind] = useState<ConfirmKind | null>(null);
   const [confirmText, setConfirmText] = useState("");
+  const [emergencyBusy, setEmergencyBusy] = useState(false);
   const [reason, setReason] = useState("Operator command from GCS");
   const [clock, setClock] = useState(() => new Date());
   const previousPhase = useRef<string | null>(null);
@@ -67,6 +68,19 @@ export function App() {
     return Array.isArray(source) ? source : Object.values(source);
   }, [state?.fleet.vehicles]);
   const online = vehicles.filter((vehicle) => vehicle.connected && !vehicle.stale).length;
+  /*
+   * Emergency controls stay in the same place on every screen and are enabled whenever an
+   * aircraft could be under power in the air — not only while the mission phase says
+   * EXECUTING. A phase that has not caught up, an aborted sortie with aircraft still
+   * airborne, or a link that has dropped must never cost the operator the recall button.
+   */
+  const airborne = vehicles.some((vehicle) => vehicle.armed || (vehicle.agl_m ?? 0) > 1.5);
+  const emergencyLive = executing || airborne || Boolean(mission?.recall);
+  const emergencyBlockReason = !connected
+    ? "Local ground service is unreachable — nothing can be transmitted"
+    : emergencyLive
+      ? null
+      : "No sortie executing and no aircraft reporting airborne";
 
   useEffect(() => {
     const timer = window.setInterval(() => setClock(new Date()), 1000);
@@ -101,15 +115,35 @@ export function App() {
   const keyword = confirmKind === "recall" ? "RECALL" : "ABORT";
   const acknowledged = confirmText.trim().toUpperCase() === keyword && reason.trim().length >= 3;
 
+  /*
+   * The emergency buttons are never given the native `disabled` attribute. A disabled
+   * button drops out of the tab order and off the screen-reader list, which is the wrong
+   * trade for the two controls a pilot needs most: the spec requires them to be reachable
+   * from every mission screen. They stay focusable, report `aria-disabled`, and a blocked
+   * press says out loud why nothing happened instead of swallowing the keystroke.
+   */
+  const requestEmergency = (kind: ConfirmKind) => {
+    if (emergencyBlockReason) {
+      notify("warn", `${kind === "recall" ? "Emergency recall" : "Abort"} unavailable`, emergencyBlockReason);
+      return;
+    }
+    setConfirmKind(kind);
+  };
+
   const submitEmergency = async () => {
-    if (!confirmKind || !acknowledged) return;
+    if (!confirmKind || !acknowledged || emergencyBusy) return;
     const action = confirmKind;
-    const result = await run(
-      action === "recall" ? "Emergency recall" : "Abort mission",
-      () => (action === "recall" ? api.recall(reason.trim()) : api.abort(reason.trim())),
-      action === "recall" ? "Emergency recall commanded — fleet returning to pad" : "Mission aborted — aircraft commanded to hold",
-    );
-    if (result) setConfirmKind(null);
+    setEmergencyBusy(true);
+    try {
+      const result = await run(
+        action === "recall" ? "Emergency recall" : "Abort mission",
+        () => (action === "recall" ? api.recall(reason.trim()) : api.abort(reason.trim())),
+        action === "recall" ? "Emergency recall commanded — fleet returning to pad" : "Mission aborted — aircraft commanded to hold",
+      );
+      if (result) setConfirmKind(null);
+    } finally {
+      setEmergencyBusy(false);
+    }
   };
 
   if (!booted) {
@@ -196,26 +230,31 @@ export function App() {
               {clock.toLocaleTimeString("en-GB", { hour12: false })}
             </span>
 
-            {executing && (
-              <>
-                <button
-                  className="btn danger sm"
-                  onClick={() => setConfirmKind("abort")}
-                  disabled={busy !== null}
-                  title="Stop the mission and command every aircraft to hold"
-                >
-                  <TriangleAlert size={13} /> Abort
-                </button>
-                <button
-                  className="btn emergency sm"
-                  onClick={() => setConfirmKind("recall")}
-                  disabled={busy !== null}
-                  title="Command every aircraft to return to the launch pad"
-                >
-                  <RotateCcw size={13} /> Emergency recall
-                </button>
-              </>
-            )}
+            <div className="emergency-cluster">
+              <button
+                className={clsx("btn danger sm", emergencyBlockReason && "is-blocked")}
+                onClick={() => requestEmergency("abort")}
+                aria-disabled={emergencyBlockReason !== null}
+                aria-label="Abort mission and command every aircraft to hold"
+                title={emergencyBlockReason ?? "End the mission and command every aircraft to hold — requires typing ABORT"}
+              >
+                <TriangleAlert size={13} /> Abort
+              </button>
+              <button
+                className={clsx("btn emergency sm", emergencyBlockReason && "is-blocked")}
+                onClick={() => requestEmergency("recall")}
+                aria-disabled={emergencyBlockReason !== null}
+                aria-label="Emergency recall — command every aircraft to return to the launch pad"
+                title={emergencyBlockReason ?? "Command every aircraft to return to the launch pad — requires typing RECALL"}
+              >
+                <RotateCcw size={13} /> Emergency recall
+              </button>
+              {emergencyBlockReason && (
+                <span className="micro" style={{ color: "var(--faint)", maxWidth: 150, lineHeight: 1.25 }} title={emergencyBlockReason}>
+                  {airborne ? "link down" : "idle"}
+                </span>
+              )}
+            </div>
           </div>
         </header>
 
@@ -245,6 +284,8 @@ export function App() {
 
       <Modal
         open={confirmKind !== null}
+        ariaLabel={confirmKind === "recall" ? "Emergency recall confirmation" : "Abort mission confirmation"}
+        blocking
         title={
           <span style={{ display: "inline-flex", alignItems: "center", gap: 9 }}>
             <ShieldAlert size={17} style={{ color: "var(--danger)" }} />
@@ -258,10 +299,10 @@ export function App() {
             <button className="btn ghost" onClick={() => setConfirmKind(null)}>Cancel</button>
             <button
               className={confirmKind === "recall" ? "btn emergency" : "btn danger"}
-              disabled={!acknowledged || busy !== null}
+              disabled={!acknowledged || emergencyBusy}
               onClick={() => void submitEmergency()}
             >
-              {busy ? <Loader2 size={14} className="spin" /> : confirmKind === "recall" ? <RotateCcw size={14} /> : <TriangleAlert size={14} />}
+              {emergencyBusy ? <Loader2 size={14} className="spin" /> : confirmKind === "recall" ? <RotateCcw size={14} /> : <TriangleAlert size={14} />}
               {confirmKind === "recall" ? "Command recall" : "Abort and hold"}
             </button>
           </>
@@ -277,6 +318,13 @@ export function App() {
           phase <strong>{humanise(phase)}</strong>. The command, operator identity, reason and resulting state are written
           to the local evidence log.
         </p>
+        {online < vehicles.length && (
+          <Notice tone="warn" icon={<WifiOff size={14} />}>
+            {online} of {vehicles.length} aircraft are reporting fresh telemetry. This command reaches only the linked
+            ones — an aircraft that has lost the RFD868x link is protected by its own onboard RTL failsafe, not by this
+            button. Do not read a sent command as proof that the aircraft has responded.
+          </Notice>
+        )}
         <div className="field" style={{ marginTop: 10 }}>
           <label htmlFor="emergency-reason">Reason (logged)</label>
           <input
@@ -285,7 +333,7 @@ export function App() {
             value={reason}
             onChange={(event) => setReason(event.target.value)}
             maxLength={160}
-            disabled={busy !== null}
+            disabled={emergencyBusy}
           />
         </div>
         <div className="field" style={{ marginTop: 12 }}>
@@ -301,7 +349,7 @@ export function App() {
             autoFocus
             autoComplete="off"
             spellCheck={false}
-            disabled={busy !== null}
+            disabled={emergencyBusy}
           />
         </div>
       </Modal>

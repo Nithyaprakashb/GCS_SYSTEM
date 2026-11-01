@@ -324,6 +324,17 @@ button:disabled {
   gap: 8px;
 }
 
+/* The abort/recall pair is separated from status chrome so it is never mistaken for a
+   readout, and it holds the same position on every screen of the station. */
+.emergency-cluster {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 2px;
+  padding-left: 10px;
+  border-left: 1px solid var(--line-strong);
+}
+
 .page {
   flex: 1;
   min-height: 0;
@@ -925,6 +936,7 @@ button:disabled {
   color: #5f728b;
 }
 .splash-check .state.ok { color: var(--ok); }
+.splash-check .state.warn { color: var(--warn); }
 
 .splash-actions {
   display: flex;
@@ -1278,6 +1290,11 @@ button:disabled {
 .fleet-dot.ok .pip { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
 .fleet-dot.warn .pip { background: var(--warn); }
 .fleet-dot.danger .pip { background: var(--danger); }
+/* The header puts the tone on the pip itself rather than on the chip, so both selectors
+   are needed — otherwise the top-bar link dot stays grey no matter what the fleet does. */
+.pip.ok { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+.pip.warn { background: var(--warn); }
+.pip.danger { background: var(--danger); }
 
 .mission-body {
   display: grid;
@@ -1614,6 +1631,30 @@ button:disabled {
   color: #8fa0b5;
   z-index: 2;
 }
+.video-bottom .alert {
+  color: #ffb4b8;
+}
+.video-bottom .lat {
+  color: #c3b189;
+}
+/* Why a degraded feed looks degraded, in the corner of the feed itself. */
+.video-cues {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 46px;
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.06em;
+  color: #9fb0c4;
+}
+.video-cues .alert {
+  color: #ffb4b8;
+}
 .video-panel .no-feed {
   position: absolute;
   inset: 0;
@@ -1785,6 +1826,28 @@ button:disabled {
   margin-top: 2px;
   display: flex;
   gap: 8px;
+}
+
+/* Phase rails. The segment count is the length of the state machine, so a rail that reads as
+   full really is at the end of the sequence — never a padded decoration that a later state
+   can't reach. */
+.phase-rail {
+  display: flex;
+  gap: 2px;
+  margin-top: 6px;
+}
+.phase-rail span {
+  flex: 1;
+  height: 2px;
+  border-radius: 2px;
+  min-width: 4px;
+}
+.tx-row {
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+}
+.tx-row:last-child {
+  border-bottom: none;
 }
 
 .ai-answer {
@@ -2104,6 +2167,54 @@ button:disabled {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   font-size: 10.5px;
+}
+
+/*
+ * A safety control that cannot act right now is still a control the operator must be able
+ * to reach and interrogate. The old native `disabled` swallowed the click and gave no
+ * reason. `.is-blocked` keeps the button focusable and clickable — the click produces a
+ * toast naming the precondition — while marking it visually as not currently armed.
+ */
+.btn.is-blocked {
+  background: repeating-linear-gradient(135deg, rgba(232, 86, 92, 0.16) 0 6px, rgba(232, 86, 92, 0.07) 6px 12px);
+  border-color: color-mix(in srgb, var(--danger) 55%, transparent);
+  border-style: dashed;
+  color: color-mix(in srgb, var(--danger) 78%, var(--ink));
+  filter: none;
+  box-shadow: none;
+}
+
+.btn.is-blocked:hover {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 18%, transparent);
+}
+
+/* ------------------------------------------------------ reduced motion */
+/*
+ * Vestibular safety: the radar sweep, blip pulses, spinners and slide-ins are continuous
+ * or transform-based, which is exactly what an operator with a motion sensitivity needs off.
+ * Colour, layout and information content are unchanged — nothing here hides state.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .radar-sweep,
+  .radar-blip,
+  .badge.pulse .dot,
+  .btn .spin {
+    animation: none !important;
+  }
+
+  .radar-blip {
+    opacity: 0.9;
+  }
 }
 
 /* -------------------------------------------------------------- responsive */
